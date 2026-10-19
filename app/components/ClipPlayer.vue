@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Download, ThumbsUp, ThumbsDown, Bookmark, Trash2, RefreshCw, Save, LoaderCircle, AudioLines } from '@lucide/vue'
+import { Download, ThumbsUp, ThumbsDown, Bookmark, Trash2, RefreshCw, Save, LoaderCircle, AudioLines, Film } from '@lucide/vue'
 import type { Clip } from '~/types'
 const props = defineProps<{ clipId: string | null }>()
 const emit = defineEmits<{ close: []; changed: [] }>()
@@ -47,6 +47,12 @@ async function retry() {
   catch (e) { toast(errorMessage(e), true) }
   finally { busy.value = false }
 }
+async function queueEdit() {
+  busy.value = true
+  try { await api(`/clips/${props.clipId}/edits`, { method: 'POST' }); toast('Clip in die Schnittliste gelegt.'); emit('close'); await navigateTo('/edits') }
+  catch (e) { toast(errorMessage(e), true) }
+  finally { busy.value = false }
+}
 </script>
 <template>
   <AppModal :open="!!clipId" title="Dein Moment" wide @close="!busy && emit('close')">
@@ -57,7 +63,8 @@ async function retry() {
       <div v-else class="flex aspect-video flex-col items-center justify-center gap-4 rounded-xl bg-studio-950"><AudioLines :size="36" class="text-studio-700" /><StatusBadge :status="clip.status" /><p class="max-w-md px-6 text-center text-xs text-studio-400">{{ clip.error || 'Dein Clip wird verarbeitet. Sobald der Upload abgeschlossen ist, ist die Vorschau verfügbar.' }}</p><button class="btn btn-secondary text-xs" @click="load"><RefreshCw :size="14" />Status aktualisieren</button></div>
       <div class="flex gap-2"><input v-model="title" class="input flex-1" aria-label="Clip-Titel" maxlength="200" /><button class="btn btn-secondary" :disabled="busy || !title.trim() || title === clip.title" aria-label="Titel speichern" @click="update({ title })"><Save :size="16" /></button></div>
       <div class="flex flex-wrap items-center gap-3 text-xs text-studio-400"><span class="font-semibold text-lime-300">@{{ clip.streamer_login }}</span><span>{{ dateTime(clip.created_at) }}</span><span>{{ duration(clip.duration) }}</span><span>{{ bytes(clip.size_bytes) }}</span></div>
-      <div class="rounded-lg border divider bg-studio-950 p-4 text-xs leading-relaxed text-studio-400"><h3 class="mb-2 font-medium text-zinc-200">Warum wurde geclippt?</h3><p>{{ clip.reason }}</p><span v-if="clip.trigger === 'audio'" class="mt-2 block text-[10px]">Dieser Clip stammt noch vom früheren Lautstärke-Trigger.</span><NuxtLink v-if="clip.trigger !== 'manual'" :to="`/triggers?streamer=${clip.streamer_id}`" class="mt-3 inline-block text-accent" @click="emit('close')">Trigger für diesen Streamer anpassen →</NuxtLink></div>
+      <div v-if="clip.status === 'ready'" class="flex flex-wrap items-center justify-between gap-3 rounded-lg border divider p-4"><div><p class="text-sm font-medium">Für Hochkant weiterbearbeiten</p><NuxtLink :to="`/streamers/${clip.streamer_id}?tab=layout`" class="mt-1 block text-xs text-accent" @click="emit('close')">Facecam & Chat für @{{ clip.streamer_login }} einstellen →</NuxtLink></div><button class="btn btn-secondary" :disabled="busy" @click="queueEdit"><Film :size="15" />Zur Bearbeitung</button></div>
+      <div class="rounded-lg border divider bg-studio-950 p-4 text-xs leading-relaxed text-studio-400"><h3 class="mb-2 font-medium text-zinc-200">Warum wurde geclippt?</h3><p>{{ clip.reason }}</p><span v-if="clip.trigger === 'audio'" class="mt-2 block text-[10px]">Dieser Clip stammt noch vom früheren Lautstärke-Trigger.</span><NuxtLink v-if="clip.trigger !== 'manual'" :to="`/streamers/${clip.streamer_id}`" class="mt-3 inline-block text-accent" @click="emit('close')">Trigger für diesen Streamer anpassen →</NuxtLink></div>
       <div class="flex flex-wrap items-center gap-2 border-t divider pt-5"><button class="btn btn-secondary px-3" :class="{ 'text-lime-300': clip.rating === 1 }" :disabled="busy" aria-label="Guter Treffer" :aria-pressed="clip.rating === 1" @click="update({ rating: clip.rating === 1 ? 0 : 1 })"><ThumbsUp :size="16" /></button><button class="btn btn-secondary px-3" :class="{ 'text-red-300': clip.rating === -1 }" :disabled="busy" aria-label="Uninteressanter Treffer" :aria-pressed="clip.rating === -1" @click="update({ rating: clip.rating === -1 ? 0 : -1 })"><ThumbsDown :size="16" /></button><button class="btn btn-secondary px-3" :class="{ 'text-lime-300': clip.favorite }" :disabled="busy" aria-label="Favorit umschalten" :aria-pressed="clip.favorite" @click="update({ favorite: !clip.favorite })"><Bookmark :size="16" :fill="clip.favorite ? 'currentColor' : 'none'" /></button><button class="btn btn-ghost px-3" aria-label="Clip löschen" :disabled="busy" @click="confirmDelete = !confirmDelete"><Trash2 :size="16" /></button><button v-if="clip.status === 'failed'" class="btn btn-secondary ml-auto" :disabled="busy" @click="retry"><RefreshCw :size="15" />Erneut versuchen</button><a v-if="clip.download_url" :href="clip.download_url" class="btn btn-primary ml-auto"><Download :size="16" />MP4 herunterladen</a></div>
       <div v-if="confirmDelete" class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-400/20 bg-red-400/5 p-4"><p class="text-xs text-red-200">Diesen Clip samt S3-Dateien endgültig löschen?</p><button class="btn btn-danger text-xs" :disabled="busy" @click="remove">Ja, löschen</button></div>
     </div>

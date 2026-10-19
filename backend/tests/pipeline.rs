@@ -649,6 +649,95 @@ async fn api_mutations_publish_postgres_events_over_websocket() {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
+    let profile_url = format!("{url}/streamers/{id}/editing");
+    let layout: Value = client
+        .get(&profile_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(layout["profile"]["auto_queue"], false);
+    assert!(layout["preview_url"].is_null());
+    let mut layout = layout["profile"].clone();
+    layout["facecam"]["x"] = json!(0.99);
+    assert_eq!(
+        client
+            .put(&profile_url)
+            .header("x-requested-with", "notyetclipped")
+            .json(&layout)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+    layout["facecam"]["x"] = json!(0.0);
+    layout["auto_queue"] = json!(true);
+    assert!(
+        client
+            .put(&profile_url)
+            .header("x-requested-with", "notyetclipped")
+            .json(&layout)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let saved: Value = client
+        .get(&profile_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["profile"], layout);
+    notyetclipped::jobs::log(
+        &fixture.state.pool,
+        recording_id,
+        "info",
+        "Segmentpuffer gestartet",
+    )
+    .await;
+    let jobs: Value = client
+        .get(format!("{url}/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        jobs.as_array()
+            .unwrap()
+            .iter()
+            .any(|job| job["id"] == recording_id.to_string())
+    );
+    let log_response = client
+        .get(format!("{url}/jobs/{recording_id}/logs?download=true"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        log_response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("attachment")
+    );
+    assert!(
+        log_response
+            .text()
+            .await
+            .unwrap()
+            .contains("[info] Segmentpuffer gestartet")
+    );
     let frames: Vec<_> = (0..4000)
         .step_by(250)
         .map(|time_ms| notyetclipped::triggers::Signal {
@@ -800,7 +889,11 @@ async fn semantic_clips_keep_context_pins_budgets_and_deleted_clip_deduplication
         state,
         &run,
         &state.config.data_dir.join("analysis-test"),
-        false,
+        &notyetclipped::triggers::Semantic {
+            stories: false,
+            ..Default::default()
+        },
+        &ai::Settings::default(),
     )
     .await
     .unwrap();
@@ -813,6 +906,7 @@ async fn semantic_clips_keep_context_pins_budgets_and_deleted_clip_deduplication
         confidence: 0.9,
         title: "Testgeschichte".into(),
         reason: "Anfang und Pointe".into(),
+        trigger_id: "story".into(),
     };
     let profile = &streamer.trigger_profile.semantic;
     let mut edited = profile.clone();
@@ -982,7 +1076,181 @@ async fn semantic_scheduler_respects_pause_request_budgets_and_new_footage() {
         .execute(&state.pool)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO trigger_events(streamer_id) SELECT $1 FROM generate_series(1,6)")
+        .bind(streamer.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert!(
+        ai::reserve(state).await.unwrap().is_none(),
+        "Do not transcribe when no clip budget is available"
+    );
+    sqlx::query("DELETE FROM trigger_events")
+        .execute(&state.pool)
+        .await
+        .unwrap();
     assert!(ai::reserve(state).await.unwrap().is_some());
+    assert!(
+        ai::reserve(state).await.unwrap().is_none(),
+        "Never prepare concurrently or pin an unbounded backlog"
+    );
+    fixture.clean().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL, FFmpeg and S3 test services"]
+async fn vertical_edit_queue_snapshots_layout_renders_and_deletes_with_source() {
+    use notyetclipped::{editing, jobs};
+    let fixture = Fixture::new().await;
+    let state = &fixture.state;
+    let streamer = fixture.streamer().await;
+    let source = generate_source(state).await;
+    let recording = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO recordings(id,streamer_id,ended_at,latest_ms) VALUES ($1,$2,now(),24000)",
+    )
+    .bind(recording)
+    .bind(streamer.id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let clip_id = Uuid::new_v4();
+    let source_key = format!("fixtures/{clip_id}.ts");
+    state
+        .storage
+        .upload(&source, &source_key, "video/mp2t")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO clips(id,streamer_id,recording_id,title,status,start_ms,end_ms,video_key) VALUES ($1,$2,$3,'Editing fixture','ready',0,24000,$4)").bind(clip_id).bind(streamer.id).bind(recording).bind(&source_key).execute(&state.pool).await.unwrap();
+    let profile = editing::Profile {
+        auto_queue: true,
+        facecam_enabled: true,
+        chat_mode: "panel".into(),
+        framing: "fill".into(),
+        ..Default::default()
+    };
+    let mut tx = state.pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO editing_profiles(streamer_id,profile) VALUES ($1,$2)")
+        .bind(streamer.id)
+        .bind(json!(profile))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    editing::auto_enqueue(&mut tx, clip_id, streamer.id)
+        .await
+        .unwrap();
+    let id = editing::enqueue(&mut tx, clip_id, &profile).await.unwrap();
+    assert_eq!(
+        editing::enqueue(&mut tx, clip_id, &editing::Profile::default())
+            .await
+            .unwrap(),
+        id,
+        "Double-click must not create duplicate active work or replace the snapshot"
+    );
+    tx.commit().await.unwrap();
+    let saved: Value = sqlx::query_scalar("SELECT profile FROM edits WHERE id=$1")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(saved, json!(profile));
+    assert_eq!(editing::reserve(state).await.unwrap(), Some(id));
+    assert!(editing::reserve(state).await.unwrap().is_none());
+    worker::recover(state).await.unwrap();
+    assert_eq!(
+        editing::reserve(state).await.unwrap(),
+        Some(id),
+        "Interrupted edits resume with the same snapshot"
+    );
+    assert!(
+        jobs::list(&state.pool)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == id.to_string() && j["active"] == true)
+    );
+    editing::process(state, id).await.unwrap();
+    let edit: editing::Edit = sqlx::query_as("SELECT * FROM edits WHERE id=$1")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(edit.status, "ready", "{:?}", edit.error);
+    assert!(edit.size_bytes > 1000);
+    let output = state.config.data_dir.join("downloaded-edit.mp4");
+    let object = state
+        .storage
+        .client
+        .get_object()
+        .bucket(&state.storage.bucket)
+        .key(&edit.video_key)
+        .send()
+        .await
+        .unwrap();
+    tokio::fs::write(&output, object.body.collect().await.unwrap().into_bytes())
+        .await
+        .unwrap();
+    let bmp = media::ffmpeg(
+        &state.config,
+        &[
+            "-i".into(),
+            output.to_string_lossy().into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-c:v".into(),
+            "bmp".into(),
+            "pipe:1".into(),
+        ],
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(&bmp[..2], b"BM");
+    assert_eq!(i32::from_le_bytes(bmp[18..22].try_into().unwrap()), 720);
+    assert_eq!(
+        i32::from_le_bytes(bmp[22..26].try_into().unwrap()).abs(),
+        1280
+    );
+    assert!(
+        media::decode_audio(&state.config, &output)
+            .await
+            .unwrap()
+            .len()
+            > 16000
+    );
+    let logs: i64 = sqlx::query_scalar("SELECT count(*) FROM job_logs WHERE job_id=$1")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert!(logs >= 4);
+    sqlx::query("UPDATE clips SET status='deleting' WHERE id=$1")
+        .bind(clip_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    worker::delete_clip(state, clip_id).await.unwrap();
+    assert!(
+        state
+            .storage
+            .client
+            .head_object()
+            .bucket(&state.storage.bucket)
+            .key(&edit.video_key)
+            .send()
+            .await
+            .is_err()
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM edits WHERE clip_id=$1")
+        .bind(clip_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
     fixture.clean().await;
 }
 

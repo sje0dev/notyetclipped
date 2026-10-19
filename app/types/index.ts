@@ -23,13 +23,15 @@ export interface Streamer {
 export type TriggerMetric = 'audio_rise' | 'audio_level' | 'chat_messages' | 'chat_users' | 'chat_rate'
 export interface TriggerCondition { metric: TriggerMetric; op: 'gte' | 'lte'; value: number }
 export interface TriggerRule { name: string; enabled: boolean; hold_seconds: number; conditions: TriggerCondition[] }
-export interface SemanticTrigger { enabled: boolean; stories: boolean; visual: boolean; interval_seconds: number; min_confidence: number; guidance: string }
+export interface ContentRule { id: string; name: string; enabled: boolean; kind: 'story' | 'visual'; description: string }
+export interface SemanticTrigger { enabled: boolean; stories: boolean; visual: boolean; interval_seconds: number; min_confidence: number; guidance: string; exclusions: string; context_seconds: number; language: string; use_feedback: boolean; rules: ContentRule[] }
 export interface TriggerProfile { version: number; warmup_seconds: number; cooldown_seconds: number; hourly_limit: number; rules: TriggerRule[]; semantic: SemanticTrigger }
-export interface AiSettings { enabled: boolean; model: string; hourly_limit: number; daily_limit: number }
-export interface AiRun { id: string; streamer_id: string; status: string; message: string; created_at: string; clip_id: string | null; result: { title: string; reason: string; confidence: number; kind: string } | null }
+export interface AiSettings { enabled: boolean; model: string; hourly_limit: number; daily_limit: number; cpu_threads: number; frame_count: number; paced: boolean }
+export interface AiRun { id: string; streamer_id: string; status: string; message: string; created_at: string; clip_id: string | null; preparation_ms: number | null; inference_ms: number | null; result: { title: string; reason: string; confidence: number; kind: string; trigger_id: string } | null }
 export interface AiStatus {
   settings: AiSettings; paused_reason: string | null; requests_hour: number; requests_day: number; transcription_ready: boolean
   auth: { connected: boolean; plan_allowed: boolean; active: string | null; accounts: { id: string; email: string }[] }; runs: AiRun[]
+  scheduler: { active_streamers: number; budget_interval_seconds: number | null; preparation_seconds: number | null; inference_seconds: number | null }
 }
 export interface TriggerSignal {
   time_ms: number
@@ -72,6 +74,10 @@ export interface Clip {
   video_url?: string | null
   download_url?: string | null
 }
+
+export interface CropRect { x: number; y: number; width: number; height: number }
+export interface EditingSettings { auto_queue: boolean; framing: 'fit' | 'fill'; gameplay: CropRect; facecam_enabled: boolean; facecam: CropRect; facecam_position: 'top' | 'bottom'; facecam_percent: number; chat_mode: 'keep' | 'hide' | 'panel'; chat: CropRect }
+export interface EditJob { id: string; clip_id: string; title: string; streamer_id: string; streamer_login: string; status: string; profile: EditingSettings; size_bytes: number; error: string | null; created_at: string; video_url?: string; download_url?: string }
 
 export interface Settings {
   max_recordings: number

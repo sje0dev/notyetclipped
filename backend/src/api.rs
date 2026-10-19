@@ -11,9 +11,9 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::{
-    ai, chatgpt,
+    ai, chatgpt, editing,
     error::{ApiError, conflict, invalid, missing},
-    events,
+    events, jobs,
     media::safe_path,
     models::{ACTIVE, Clip, ManifestEntry, Recording, Settings, Streamer, StreamerInput},
     services,
@@ -81,12 +81,23 @@ pub fn routes(config: &mut web::ServiceConfig) {
             .route("/ai/models", web::get().to(ai_models))
             .route("/ws", web::get().to(events::websocket))
             .route("/dashboard", web::get().to(dashboard))
+            .route("/activities", web::get().to(activities))
+            .route("/jobs", web::get().to(list_jobs))
+            .route("/jobs/{id}/logs", web::get().to(job_logs))
+            .route("/edits", web::get().to(list_edits))
+            .route("/edits/{id}/retry", web::post().to(retry_edit))
             .route("/streamers", web::get().to(list_streamers))
             .route("/streamers", web::post().to(add_streamer))
             .route("/streamers/{id}", web::patch().to(update_streamer))
             .route("/streamers/{id}", web::delete().to(remove_streamer))
             .route("/streamers/{id}/clip", web::post().to(manual_clip))
             .route("/streamers/{id}/signals", web::get().to(trigger_signals))
+            .route("/streamers/{id}/analyses", web::get().to(streamer_analyses))
+            .route("/streamers/{id}/editing", web::get().to(editing_profile))
+            .route(
+                "/streamers/{id}/editing",
+                web::put().to(save_editing_profile),
+            )
             .route(
                 "/streamers/{id}/triggers/test",
                 web::post().to(test_triggers),
@@ -100,6 +111,7 @@ pub fn routes(config: &mut web::ServiceConfig) {
             .route("/clips/{id}", web::patch().to(update_clip))
             .route("/clips/{id}", web::delete().to(delete_clip))
             .route("/clips/{id}/retry", web::post().to(retry_clip))
+            .route("/clips/{id}/edits", web::post().to(queue_edit))
             .route("/settings", web::get().to(get_settings))
             .route("/settings", web::put().to(update_settings))
             .route("/storage", web::get().to(storage_info)),
@@ -108,6 +120,171 @@ pub fn routes(config: &mut web::ServiceConfig) {
 
 async fn ai_status(state: web::Data<State>) -> Response {
     Ok(web::Json(ai::status(&state).await?))
+}
+
+async fn streamer_analyses(state: web::Data<State>, id: web::Path<Uuid>) -> Response {
+    let runs: Vec<ai::Run> = sqlx::query_as(
+        "SELECT * FROM ai_runs WHERE streamer_id=$1 ORDER BY created_at DESC LIMIT 10",
+    )
+    .bind(*id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(web::Json(json!(runs)))
+}
+
+async fn activities(state: web::Data<State>) -> Response {
+    let rows: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(a) FROM (SELECT id,streamer_id,kind,message,created_at FROM activities ORDER BY created_at DESC,id DESC LIMIT 30) a")
+        .fetch_all(&state.pool).await?;
+    Ok(web::Json(json!(rows)))
+}
+
+async fn list_jobs(state: web::Data<State>) -> Response {
+    Ok(web::Json(jobs::list(&state.pool).await?))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    download: Option<bool>,
+}
+async fn job_logs(
+    state: web::Data<State>,
+    id: web::Path<Uuid>,
+    query: web::Query<LogQuery>,
+) -> Result<HttpResponse, ApiError> {
+    let rows: Vec<(i64,DateTime<Utc>,String,String)> = sqlx::query_as("SELECT id,created_at,level,message FROM (SELECT * FROM job_logs WHERE job_id=$1 ORDER BY id DESC LIMIT 500) recent ORDER BY id")
+        .bind(*id).fetch_all(&state.pool).await?;
+    if query.download == Some(true) {
+        let text = rows
+            .iter()
+            .map(|(_, at, level, message)| format!("{} [{level}] {message}\n", at.to_rfc3339()))
+            .collect::<String>();
+        return Ok(HttpResponse::Ok()
+            .content_type("text/plain; charset=utf-8")
+            .insert_header((
+                "Content-Disposition",
+                format!("attachment; filename=\"job-{id}.log\""),
+            ))
+            .body(text));
+    }
+    Ok(HttpResponse::Ok().json(rows.into_iter().map(|(id,at,level,message)|json!({"id":id,"created_at":at,"level":level,"message":message})).collect::<Vec<_>>()))
+}
+
+async fn editing_profile(state: web::Data<State>, id: web::Path<Uuid>) -> Response {
+    get_streamer(&state, *id).await?;
+    let value: Option<Value> =
+        sqlx::query_scalar("SELECT profile FROM editing_profiles WHERE streamer_id=$1")
+            .bind(*id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let profile: editing::Profile = value
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(anyhow::Error::from)?
+        .unwrap_or_default();
+    let key: Option<String> = sqlx::query_scalar("SELECT thumbnail_key FROM clips WHERE streamer_id=$1 AND status='ready' AND thumbnail_key IS NOT NULL ORDER BY created_at DESC LIMIT 1").bind(*id).fetch_optional(&state.pool).await?;
+    let preview = match key {
+        Some(key) => Some(state.storage.url(&key, None).await?),
+        None => None,
+    };
+    Ok(web::Json(json!({"profile":profile,"preview_url":preview})))
+}
+
+async fn save_editing_profile(
+    state: web::Data<State>,
+    id: web::Path<Uuid>,
+    input: web::Json<editing::Profile>,
+    _: ApplicationRequest,
+) -> Response {
+    get_streamer(&state, *id).await?;
+    input.validate().map_err(|e| invalid(e.to_string()))?;
+    sqlx::query("INSERT INTO editing_profiles(streamer_id,profile) VALUES ($1,$2) ON CONFLICT(streamer_id) DO UPDATE SET profile=EXCLUDED.profile")
+        .bind(*id).bind(json!(&*input)).execute(&state.pool).await?;
+    Ok(web::Json(json!(&*input)))
+}
+
+async fn queue_edit(
+    state: web::Data<State>,
+    id: web::Path<Uuid>,
+    _: ApplicationRequest,
+) -> Response {
+    let mut tx = state.pool.begin().await?;
+    let clip: Clip = sqlx::query_as("SELECT * FROM clips WHERE id=$1 FOR UPDATE")
+        .bind(*id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(missing)?;
+    if clip.status != "ready" {
+        return Err(conflict(
+            "Nur fertige Clips können zur Bearbeitung geschickt werden.",
+        ));
+    }
+    let value: Option<Value> =
+        sqlx::query_scalar("SELECT profile FROM editing_profiles WHERE streamer_id=$1")
+            .bind(clip.streamer_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let profile: editing::Profile = value
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(anyhow::Error::from)?
+        .unwrap_or_default();
+    let edit_id = editing::enqueue(&mut tx, clip.id, &profile).await?;
+    tx.commit().await?;
+    events::publish(&state.pool, "edit.updated", Some(edit_id)).await;
+    Ok(web::Json(json!({"id":edit_id})))
+}
+
+async fn list_edits(state: web::Data<State>) -> Response {
+    let rows: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(e)||jsonb_build_object('title',c.title,'streamer_id',c.streamer_id,'streamer_login',s.login) FROM edits e JOIN clips c ON c.id=e.clip_id JOIN streamers s ON s.id=c.streamer_id ORDER BY e.created_at DESC LIMIT 100")
+        .fetch_all(&state.pool).await?;
+    let mut result = Vec::new();
+    for mut row in rows {
+        let key = row.as_object_mut().unwrap().remove("video_key").unwrap();
+        if row["status"] == "ready" {
+            let key = key.as_str().unwrap();
+            row["video_url"] = json!(state.storage.url(key, None).await?);
+            row["download_url"] = json!(state.storage.url(key, Some("hochkant.mp4")).await?);
+        }
+        result.push(row);
+    }
+    Ok(web::Json(json!(result)))
+}
+
+async fn retry_edit(
+    state: web::Data<State>,
+    id: web::Path<Uuid>,
+    _: ApplicationRequest,
+) -> Response {
+    let mut tx = state.pool.begin().await?;
+    let clip_id: Uuid = sqlx::query_scalar("SELECT clip_id FROM edits WHERE id=$1")
+        .bind(*id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(missing)?;
+    let clip: Clip = sqlx::query_as("SELECT * FROM clips WHERE id=$1 FOR UPDATE")
+        .bind(clip_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM edits WHERE clip_id=$1 AND status IN ('queued','rendering'))",
+    )
+    .bind(clip_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if clip.status != "ready" || active {
+        return Err(conflict(
+            "Quelle nicht bereit oder Bearbeitung bereits aktiv.",
+        ));
+    }
+    let changed=sqlx::query("UPDATE edits SET status='queued',error=NULL,finished_at=NULL WHERE id=$1 AND status='failed'").bind(*id).execute(&mut *tx).await?;
+    if changed.rows_affected() == 0 {
+        return Err(conflict(
+            "Nur fehlgeschlagene Bearbeitungen können wiederholt werden.",
+        ));
+    }
+    tx.commit().await?;
+    events::publish(&state.pool, "edit.updated", Some(*id)).await;
+    Ok(web::Json(json!({"ok":true})))
 }
 
 async fn ai_models(state: web::Data<State>) -> Response {
@@ -223,7 +400,7 @@ async fn dashboard(state: web::Data<State>) -> Response {
     let count = |status: &str| counts.iter().find(|c| c.0 == status).map_or(0, |c| c.1);
     let today: i64 = sqlx::query_scalar("SELECT count(*) FROM clips WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AND status != 'deleting'").fetch_one(&state.pool).await?;
     let stored: i64 = sqlx::query_scalar(
-        "SELECT coalesce(sum(size_bytes),0)::bigint FROM clips WHERE status='ready'",
+        "SELECT (SELECT coalesce(sum(size_bytes),0) FROM clips WHERE status='ready')::bigint+(SELECT coalesce(sum(size_bytes),0) FROM edits WHERE status='ready')::bigint",
     )
     .fetch_one(&state.pool)
     .await?;
@@ -673,7 +850,7 @@ async fn update_settings(
 async fn storage_info(state: web::Data<State>) -> Response {
     let disk = nix::sys::statvfs::statvfs(&state.config.data_dir).map_err(anyhow::Error::from)?;
     let stored: i64 = sqlx::query_scalar(
-        "SELECT coalesce(sum(size_bytes),0)::bigint FROM clips WHERE status='ready'",
+        "SELECT (SELECT coalesce(sum(size_bytes),0) FROM clips WHERE status='ready')::bigint+(SELECT coalesce(sum(size_bytes),0) FROM edits WHERE status='ready')::bigint",
     )
     .fetch_one(&state.pool)
     .await?;

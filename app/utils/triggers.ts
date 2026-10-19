@@ -1,6 +1,16 @@
-import type { SemanticTrigger, TriggerMetric, TriggerProfile } from '~/types'
+import type { ContentRule, SemanticTrigger, TriggerMetric, TriggerProfile } from '~/types'
 
-export const semanticDefault = (): SemanticTrigger => ({ enabled: false, stories: true, visual: true, interval_seconds: 90, min_confidence: 0.8, guidance: '' })
+export const semanticDefault = (): SemanticTrigger => ({ enabled: false, stories: true, visual: true, interval_seconds: 90, min_confidence: 0.8, guidance: '', exclusions: '', context_seconds: 120, language: 'auto', use_feedback: true, rules: [] })
+export const contentPresets: Omit<ContentRule, 'id' | 'enabled'>[] = [
+  { name: 'Konter & Schlagabtausch', kind: 'story', description: 'Ein unerwarteter trockener Konter, ein treffender Roast unter Freunden oder ein kurzer, absurder Dialog. Die ursprüngliche Frage oder Behauptung, den Konter und die direkte Reaktion mitnehmen. Gewöhnliche Beleidigungen ohne Pointe auslassen.' },
+  { name: 'Story mit Pointe', kind: 'story', description: 'Eine persönlich erzählte Geschichte mit verständlichem Aufbau, überraschender Wendung und abgeschlossener Pointe. Am Beginn erklären, wer oder was gemeint ist. Nicht mitten im Satz beginnen und keinen noch offenen Erzählbogen abschneiden.' },
+  { name: 'Fails & Eigentore', kind: 'visual', description: 'Ein klar sichtbarer, unerwarteter Fehlschlag mit nachvollziehbarer Ursache: Selbstüberschätzung, missglückter Plan oder ein ironisches Eigentor. Den Versuch davor und die Reaktion danach zeigen. Keine zufälligen Tode ohne Besonderheit; nur in den Bildern belegte Ereignisse.' },
+  { name: 'Clutch & Comeback', kind: 'visual', description: 'Eine sichtbar schwierige Situation wird unerwartet gerettet, ein knappes Duell gewonnen oder ein außergewöhnliches Ziel erreicht. Gefahr, entscheidenden Moment und Ergebnis müssen erkennbar sein. Keine angeblichen Erfolge aus bloßen Zurufen ableiten.' },
+  { name: 'Überraschung & Enthüllung', kind: 'story', description: 'Eine Information, ein Geständnis oder eine Enthüllung verändert die Situation und löst eine echte, überraschende Reaktion aus. Erwartung davor, Enthüllung und Reaktion gehören zusammen. Alltägliche Ankündigungen und bloßen Clickbait auslassen.' },
+  { name: 'Eskalation & gespielte Empörung', kind: 'story', description: 'Eine kleine Situation eskaliert zu einer absurden Tirade, übertriebenem Rollenspiel oder gespielter Empörung mit komödiantischer Steigerung. Auslöser, stärkste Steigerung und Abschluss sichern. Lautstärke oder monotones Schimpfen allein zählen nicht.' },
+  { name: 'Emotionale Momente', kind: 'story', description: 'Ein ehrlicher, berührender oder besonders herzlicher Austausch: Dank, Wiedersehen, unerwartete Unterstützung oder eine persönliche Erkenntnis mit klarem Abschluss. Den Anlass mitnehmen. Gewöhnliche Begrüßungen und routinemäßige Spenden-Danksagungen auslassen.' },
+  { name: 'Prank & Reaktion', kind: 'visual', description: 'Ein sichtbarer Streich, eine Falle oder eine überraschende Aktion mit verständlicher Vorbereitung und unmittelbarer Reaktion der Beteiligten. Den tatsächlichen Ausgang zeigen; über einen geplanten Streich zu reden ist noch kein visueller Prank.' },
+]
 export const clipSource = (trigger: string) => ({ story: 'Story & Gespräch', visual: 'Video-Moment', rule: 'Audio & Chat', audio: 'Audio · früher', manual: 'Manuell' })[trigger] || trigger
 
 export const triggerMetrics: Record<TriggerMetric, { label: string; unit: string; min: number; max: number; step: number; value: number; hint: string }> = {

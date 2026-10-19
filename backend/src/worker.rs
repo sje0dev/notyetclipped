@@ -15,7 +15,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    ai, events,
+    ai, editing, events, jobs,
     media::{overlaps, render, safe_path, tail},
     models::{ACTIVE, Clip, ManifestEntry, Recording, Segment, Streamer},
     recording, services,
@@ -25,6 +25,9 @@ use crate::{
 pub async fn recover(state: &State) -> Result<()> {
     let mut tx = state.pool.begin().await?;
     sqlx::query("UPDATE clips SET status='queued' WHERE status IN ('cutting','uploading')")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE edits SET status='queued' WHERE status='rendering'")
         .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE ai_runs SET status='failed',message='Analyse durch Worker-Neustart unterbrochen.',finished_at=now() WHERE status IN ('preparing','analyzing')").execute(&mut *tx).await?;
@@ -41,15 +44,24 @@ pub async fn recover(state: &State) -> Result<()> {
     )
     .await?;
     tx.commit().await?;
-    let analysis = state.config.data_dir.join("analysis");
-    if analysis.exists() {
-        tokio::fs::remove_dir_all(analysis).await?;
+    for name in ["analysis", "edits"] {
+        let directory = state.config.data_dir.join(name);
+        if directory.exists() {
+            tokio::fs::remove_dir_all(directory).await?;
+        }
     }
     events::publish(&state.pool, "system.updated", None).await;
     Ok(())
 }
 
 pub async fn export_clip(state: &State, id: Uuid) -> Result<()> {
+    jobs::log(
+        &state.pool,
+        id,
+        "info",
+        "Clip-Export gestartet: Originalsegmente schneiden und MP4 erstellen.",
+    )
+    .await;
     let directory = state.config.data_dir.join("exports").join(id.to_string());
     let result: Result<()> = async {
         let clip: Clip = sqlx::query_as("SELECT * FROM clips WHERE id=$1").bind(id).fetch_one(&state.pool).await?;
@@ -61,6 +73,7 @@ pub async fn export_clip(state: &State, id: Uuid) -> Result<()> {
         sqlx::query("UPDATE clips SET video_key=$2,thumbnail_key=$3 WHERE id=$1").bind(id).bind(&video_key).bind(&thumbnail_key).execute(&state.pool).await?;
         let manifest: Vec<ManifestEntry> = serde_json::from_value(clip.manifest)?;
         let (video, thumbnail) = render(&state.config, &manifest, clip.start_ms, clip.end_ms, &directory).await?;
+        jobs::log(&state.pool,id,"info","MP4 und Vorschaubild fertig. Upload in privaten S3-Speicher.").await;
         let changed = sqlx::query("UPDATE clips SET status='uploading' WHERE id=$1 AND status != 'deleting'").bind(id).execute(&state.pool).await?;
         if changed.rows_affected() == 0 { return Ok(()); }
         events::publish(&state.pool, "clip.updated", Some(id)).await;
@@ -70,6 +83,7 @@ pub async fn export_clip(state: &State, id: Uuid) -> Result<()> {
         let mut tx = state.pool.begin().await?;
         let changed = sqlx::query("UPDATE clips SET status='ready',error=NULL,ready_at=now(),size_bytes=$2 WHERE id=$1 AND status != 'deleting'").bind(id).bind(size as i64).execute(&mut *tx).await?;
         if changed.rows_affected() > 0 {
+            editing::auto_enqueue(&mut tx,clip.id,clip.streamer_id).await?;
             services::activity(&mut tx, "clip", &format!("Clip von @{login} in S3 gespeichert."), Some(clip.streamer_id)).await?;
         }
         tx.commit().await?;
@@ -77,9 +91,12 @@ pub async fn export_clip(state: &State, id: Uuid) -> Result<()> {
         Ok(())
     }.await;
     if let Err(error) = result {
+        jobs::log(&state.pool, id, "error", &error.to_string()).await;
         tracing::warn!(%error,%id,"Clip export failed");
         sqlx::query("UPDATE clips SET error=$2,status=CASE WHEN attempts<5 THEN 'retry' ELSE 'failed' END,retry_at=now()+(LEAST(600,15*power(2,LEAST(attempts,5)))*interval '1 second') WHERE id=$1 AND status NOT IN ('deleting','ready')")
             .bind(id).bind(tail(&error.to_string(),800)).execute(&state.pool).await?;
+    } else {
+        jobs::log(&state.pool, id, "info", "Clip-Verarbeitung abgeschlossen.").await;
     }
     events::publish(&state.pool, "clip.updated", Some(id)).await;
     Ok(())
@@ -94,10 +111,26 @@ pub async fn delete_clip(state: &State, id: Uuid) -> Result<()> {
         let Some(clip) = clip else {
             return Ok(());
         };
-        let keys: Vec<String> = [clip.video_key, clip.thumbnail_key]
+        let rendering: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM edits WHERE clip_id=$1 AND status='rendering')",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+        anyhow::ensure!(
+            !rendering,
+            "Hochkant-Export wird beendet; Löschung wird danach fortgesetzt."
+        );
+        let mut keys: Vec<String> = [clip.video_key, clip.thumbnail_key]
             .into_iter()
             .flatten()
             .collect();
+        let edit_keys: Vec<String> =
+            sqlx::query_scalar("SELECT video_key FROM edits WHERE clip_id=$1")
+                .bind(id)
+                .fetch_all(&state.pool)
+                .await?;
+        keys.extend(edit_keys);
         state.storage.delete(&keys).await?;
         let directory = state.config.data_dir.join("exports").join(id.to_string());
         if directory.exists() {
@@ -204,6 +237,9 @@ pub async fn clean_buffers(state: &State, buffer_seconds: i64) -> Result<()> {
     sqlx::query("DELETE FROM ai_runs WHERE finished_at < now()-interval '7 days'")
         .execute(&state.pool)
         .await?;
+    sqlx::query("DELETE FROM job_logs WHERE created_at < now()-interval '7 days'")
+        .execute(&state.pool)
+        .await?;
     // Keep session metadata referenced by clips; discard empty offline checks after a week.
     sqlx::query("DELETE FROM recordings r WHERE ended_at < now()-interval '7 days' AND NOT EXISTS(SELECT 1 FROM clips WHERE recording_id=r.id) AND NOT EXISTS(SELECT 1 FROM segments WHERE recording_id=r.id)").execute(&state.pool).await?;
     Ok(())
@@ -263,6 +299,7 @@ pub async fn serve(state: State) -> Result<()> {
     let analysis = Arc::new(Semaphore::new(2));
     let mut recorders: HashMap<Uuid, RecorderHandle> = HashMap::new();
     let mut exports: HashMap<Uuid, JoinHandle<Result<()>>> = HashMap::new();
+    let mut edit_task: Option<JoinHandle<Result<()>>> = None;
     let mut last_cleanup = Instant::now() - Duration::from_secs(60);
     let mut last_heartbeat_event = Instant::now() - Duration::from_secs(60);
     let mut used = 0;
@@ -274,6 +311,12 @@ pub async fn serve(state: State) -> Result<()> {
             break;
         }
         let tick:Result<()>=async {
+            if edit_task.as_ref().is_some_and(|task|task.is_finished())
+                && let Some(task)=edit_task.take()
+                && let Err(error)=task.await.context("Editing task panicked").and_then(|r|r) {
+                    tracing::warn!(%error,"Hochkant-Export fehlgeschlagen");
+                    sqlx::query("UPDATE edits SET status='failed',error='Bearbeitung unterbrochen. Bitte erneut versuchen.',finished_at=now() WHERE status='rendering'").execute(&state.pool).await?;
+            }
             let finished:Vec<_>=recorders.iter().filter(|(_,r)|r.task.is_finished()).map(|(id,_)|*id).collect();
             for id in finished {
                 if let Some(recorder)=recorders.remove(&id) {
@@ -318,7 +361,7 @@ pub async fn serve(state: State) -> Result<()> {
                     recorders.insert(id,RecorderHandle{stop,task,quality});
                 }
             }
-            let capacity=settings.max_exports.saturating_sub(exports.len());
+            let capacity=settings.max_exports.saturating_sub(exports.len()+usize::from(edit_task.is_some()));
             if capacity>0 {
                 let mut tx=state.pool.begin().await?;
                 let ids:Vec<Uuid>=exports.keys().copied().collect();
@@ -334,7 +377,13 @@ pub async fn serve(state: State) -> Result<()> {
                     exports.insert(id,tokio::spawn(async move { if clip.status=="deleting" { delete_clip(&state,id).await } else { export_clip(&state,id).await } }));
                 }
             }
-            let details=recording::stats(recorders.len(),exports.len(),used,free,blocked);
+            // Original clips have priority. One editing job shares the configured export slots.
+            if !blocked && edit_task.is_none() && exports.len()<settings.max_exports
+                && let Some(id)=editing::reserve(&state).await? {
+                    let state=state.clone();
+                    edit_task=Some(tokio::spawn(async move {editing::process(&state,id).await}));
+            }
+            let details=recording::stats(recorders.len(),exports.len()+usize::from(edit_task.is_some()),used,free,blocked);
             sqlx::query("INSERT INTO worker_state(id,heartbeat_at,details) VALUES (1,now(),$1) ON CONFLICT(id) DO UPDATE SET heartbeat_at=now(),details=EXCLUDED.details").bind(details).execute(&state.pool).await?;
             if last_heartbeat_event.elapsed()>Duration::from_secs(10) {
                 events::publish(&state.pool,"system.updated",None).await;
@@ -348,6 +397,10 @@ pub async fn serve(state: State) -> Result<()> {
     }
     semantic.abort();
     let _ = semantic.await;
+    if let Some(task) = edit_task {
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(error) = fatal {
         // Leadership has been lost. Stop all work before another supervisor can take over.
         for recorder in recorders.values() {

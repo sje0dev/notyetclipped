@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     chat::Chat,
-    events,
+    events, jobs,
     media::{decode_audio, tail},
     models::{Recording, Streamer},
     services,
@@ -306,9 +306,12 @@ impl Ingest {
                 self.chat = None;
             }
             if analyze {
-                let _permit = semaphore.acquire().await?;
                 let observed_at = Instant::now();
-                match decode_audio(&state.config, &segment.path).await {
+                let decoded = {
+                    let _permit = semaphore.acquire().await?;
+                    decode_audio(&state.config, &segment.path).await
+                };
+                match decoded {
                     Ok(pcm) => {
                         let mut frames = self.analyzer.feed(&pcm, segment.start);
                         if let Some(chat) = &self.chat {
@@ -407,6 +410,15 @@ impl Ingest {
                 }
             }
             if first_segment || !analyze {
+                if first_segment {
+                    jobs::log(
+                        &state.pool,
+                        self.id,
+                        "info",
+                        "Erstes Videosegment empfangen. Puffer, Audio- und Chat-Auswertung laufen.",
+                    )
+                    .await;
+                }
                 events::publish(&state.pool, "stream.updated", Some(self.streamer_id)).await;
             }
         }
@@ -439,6 +451,16 @@ pub async fn run(
         .await?;
     tx.commit().await?;
     events::publish(&state.pool, "stream.updated", Some(streamer.id)).await;
+    jobs::log(
+        &state.pool,
+        id,
+        "info",
+        &format!(
+            "Verbinde @{} · Qualität {} · Streamlink → FFmpeg-Segmentpuffer",
+            streamer.login, streamer.quality
+        ),
+    )
+    .await;
     let mut ingest = Ingest {
         id,
         streamer_id: streamer.id,
@@ -490,6 +512,15 @@ pub async fn run(
         tracing::warn!(%error, "Letztes Segment konnte nicht eingelesen werden");
     }
     let settings = services::settings(&state.pool).await?;
+    jobs::log(
+        &state.pool,
+        id,
+        if error.is_some() { "error" } else { "info" },
+        error
+            .as_deref()
+            .unwrap_or("Aufnahme beendet; letzte Segmente werden abgeschlossen."),
+    )
+    .await;
     let mut tx = state.pool.begin().await?;
     let recording: Recording =
         sqlx::query_as("UPDATE recordings SET ended_at=now(),error=$2 WHERE id=$1 RETURNING *")

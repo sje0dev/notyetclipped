@@ -35,7 +35,20 @@ pub async fn ffmpeg(config: &Config, args: &[String], timeout: Duration) -> Resu
     let output = tokio::time::timeout(
         timeout,
         Command::new(&config.ffmpeg)
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+            // Decoder/filter pools otherwise scale with every host CPU for every stream.
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-threads",
+                "1",
+                "-filter_threads",
+                "1",
+                "-filter_complex_threads",
+                "1",
+            ])
             .args(args)
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -61,6 +74,10 @@ pub async fn decode_audio(config: &Config, path: &Path) -> Result<Vec<i16>> {
         "-i",
         &path.to_string_lossy(),
         "-vn",
+        "-map",
+        "0:a:0",
+        "-threads",
+        "1",
         "-ac",
         "1",
         "-ar",

@@ -19,7 +19,7 @@ docker compose up --build -d
 
 Die Beispielkonfiguration startet PostgreSQL, RustFS als lokalen S3-kompatiblen Speicher, Datenbankmigrationen, Actix-API, Rust-Worker und Nuxt. Datenbank, S3-Dateien und Arbeitsverzeichnis liegen in getrennten Docker-Volumes. Der erste Rust-Build benötigt etwas Zeit.
 
-Im Dashboard einen Kanal hinzufügen. Der Worker startet die Aufnahme, sobald der Kanal erreichbar ist und ein Aufnahmeplatz frei ist. Unter **Automationen** die Trigger für den Kanal konfigurieren. **„Moment clippen“** reserviert einen manuellen Ausschnitt aus dem laufenden Puffer.
+Im Dashboard einen Kanal hinzufügen. Der Worker startet die Aufnahme, sobald der Kanal erreichbar ist und ein Aufnahmeplatz frei ist. Unter **Streamer → Kanal → Automationen** die Trigger konfigurieren. **„Moment clippen“** reserviert einen manuellen Ausschnitt aus dem laufenden Puffer.
 
 ```sh
 docker compose logs -f worker api
@@ -54,6 +54,9 @@ Der Backend-Zugang benötigt `ListBucket` sowie `GetObject`, `PutObject` und `De
 - Visueller Trigger-Builder: bis zu acht alternative Regeln (ODER), jeweils bis zu sechs Bedingungen (UND), eigene Mindestdauer, Kalibrierung, Clip-Abstand und Stundenlimit pro Kanal.
 - Audioanstieg und Absolutpegel mit Chatnachrichten, verschiedenen Chattern und relativem Chat-Anstieg kombinieren. Vorlagen, Live-Signale, Probelauf und Kopieren auf andere Streamer.
 - Story- und Video-Trigger mit lokaler Whisper-Transkription und ChatGPT-Bildverständnis. Anmeldung mit ChatGPT-Abo statt API-Key, eigene Anfrage-Limits und pro Kanal einstellbare Auswahlkriterien.
+- Bis zu zwölf zusätzliche Text-Trigger pro Kanal: eigene Beschreibungen, acht Vorlagen, Ausschlusskriterien und Clip-Bewertungen als redaktionelle Geschmackshinweise.
+- Schnittliste mit manueller oder automatischer Übergabe fertiger Clips; pro Streamer Hochkant-Layout mit Facecam-, Spiel- und Chat-Ausschnitten samt Vorschau.
+- Aktivitäten-Glocke und Job-Anzeige im Kopfbereich: aktive/letzte Aufträge, Verarbeitungsschritte, Fehler und herunterladbare Job-Logs.
 - Nahe automatische Treffer während des Nachlaufs zusammenführen; Clip-Länge auf maximal 120 Sekunden begrenzen.
 - Benötigte Segmente gegen die Pufferbereinigung reservieren. Schnitt nach dem Nachlauf, danach S3-Upload und Bestätigung der Objektgröße.
 - MP4 mit H.264/AAC und Faststart, JPEG-Vorschaubild, editierbarer Titel, Favoriten, Bewertung, Suche, Filter, Download und Mehrfachlöschung.
@@ -76,26 +79,40 @@ Die neue Standardregel **„Reaktion mit Chat“** verlangt gleichzeitig mindest
 
 Bei gespeicherten Chat-Regeln liest der Worker Twitch-IRC anonym über WebSocket. Keine Helix-Abfragen, kein Chatversand, kein API-Key. Gespeichert werden nur aggregierte Messwerte, keine Nachrichten oder Nutzernamen. Bei fehlender Verbindung sind Chat-Signale nicht verfügbar; die Regel fällt nicht auf Audio allein zurück. Chat wird bei Empfang mit dem zuletzt eingelesenen Videosegment kombiniert: Twitch-Latenz kann die Signale um einige Sekunden versetzen.
 
-Audio-/Chat-Regeln messen Reaktionen. Die optionale inhaltliche Analyse ergänzt Sprach- und Bildverständnis. Jeder neue automatische Clip enthält eine Begründung. Bewertungen werden gespeichert und verändern die Regeln nicht automatisch.
+Audio-/Chat-Regeln messen Reaktionen. Die optionale inhaltliche Analyse ergänzt Sprach- und Bildverständnis. Jeder neue automatische Clip enthält eine Begründung. Bewertungen verändern die Signalregeln nicht; die KI kann sie als Geschmackshinweise berücksichtigen.
 
 ### Story & Video mit dem ChatGPT-Abo
 
 1. **Einstellungen → ChatGPT & KI-Analyse → Continue with ChatGPT** öffnen. NotYetClipped verwendet den offiziellen [Sign-in-with-ChatGPT-Flow für lokal gehostete Apps](https://developers.openai.com/siwc/token-sharing-open-source).
 2. Bei OpenAI anmelden und den gewünschten Anteil des ChatGPT-Kontingents für diese App freigeben. Verfügbarkeit und zugelassene Modelle hängen vom Konto und Workspace ab. Der Browser kehrt zu `http://127.0.0.1:3000/api/ai/callback` zurück.
 3. Ein Modell mit Bildverständnis aus dem Kontokatalog wählen, Anfrage-Limits setzen und die globale Analyse aktivieren. Standard: höchstens 20 Anfragen in einer rollenden Stunde und 100 in 24 Stunden, über alle Kanäle zusammen.
-4. Unter **Automationen → Story & Video** die gewünschten Kategorien je Streamer aktivieren. Auch **Auto-Clips** muss eingeschaltet sein. Die Comedy-Vorlage eignet sich für absurde Monologe, spontane Wortwechsel, gespielte Empörung und überraschende Enthüllungen.
+4. Unter **Streamer → Kanal → Automationen → Story & Video** die gewünschten Kategorien aktivieren. Auch **Auto-Clips** muss eingeschaltet sein. Eigene Text-Trigger beschreiben präzise die gesuchten Momente. Vorlagen: Konter, Stories, Fails, Clutches, Enthüllungen, Eskalation, emotionale Momente und Pranks. Alle aktiven Trigger werden gemeinsam in **einer** Anfrage geprüft. Bestehende Freitexte bleiben erhalten.
 
-Der Worker wertet standardmäßig frühestens alle 90 Sekunden bis zu zwei Minuten gepuffertes Video aus. Whisper.cpp mit dem mehrsprachigen Base-Modell läuft lokal; das Docker-Image enthält CLI und Modell. ChatGPT erhält zeitgestempelten Text und höchstens zwölf auf 640 Pixel Breite verkleinerte Bilder (etwa ein Bild je zehn Sekunden). Rohvideo und Audiodateien werden nicht an OpenAI geschickt. Die Verarbeitung läuft seriell im Hintergrund, getrennt vom Audio-/Chat-Signalpfad. Bei mehreren Kanälen oder langsamer Transkription verlängert sich der tatsächliche Abstand.
+Der Worker wertet standardmäßig frühestens alle 90 Sekunden bis zu zwei Minuten gepuffertes Video aus; der Kontext ist auf 60–180 Sekunden einstellbar. Whisper.cpp mit dem mehrsprachigen Base-Modell läuft lokal; das Docker-Image enthält CLI und Modell. Sprache: automatisch, Deutsch oder Englisch. Reine Video-Trigger benötigen kein Transkript. ChatGPT erhält zeitgestempelten Text und höchstens 12 oder 24 auf 640 Pixel Breite verkleinerte Keyframe-Bilder (Standard 24, bei zwei Minuten etwa alle fünf Sekunden). Die tatsächlichen Bilder können um einen Keyframe-Abstand versetzt sein. Rohvideo und Audiodateien werden nicht an OpenAI geschickt.
 
-Die KI wählt höchstens einen abgeschlossenen Moment pro Fenster mit 5–120 Sekunden und einer inhaltlichen Anfangs-/Endzeit. Der normale Vor-/Nachlauf gilt hier nicht. Die Mindestbewertung ist ein subjektiver KI-Score, keine kalibrierte Wahrscheinlichkeit. Clip-Abstand und Stundenlimit werden mit den Audio-/Chat-Triggern geteilt; überlappende automatische Clips werden ausgelassen. Reservierte Segmente bleiben bis zur Entscheidung verfügbar. Nach der Auswertung werden lokale Transkripte und Analysebilder entfernt; Diagnosen und Entscheidungen bleiben sieben Tage gespeichert.
+Die lokale Analyse läuft seriell im Hintergrund. FFmpeg dekodiert für das Storyboard nur Keyframes und verwendet begrenzte Decoder-/Filter-Threads; Whisper nutzt standardmäßig zwei, einstellbar 1–4. Audioanalyse gibt ihre Semaphore unmittelbar nach dem Dekodieren wieder frei. Die Aufnahmen speichern weiterhin den Originalstream ohne Neukodierung. Fertige Clips werden vor der CPU-intensiven Hochkant-Bearbeitung bevorzugt.
 
-**Grenzen:** Geschichten über zwei Minuten, sehr kurze Aktionen zwischen den Einzelbildern und fehlerhaft transkribierte Sprache können übersehen werden. Ein Replay der Audio-/Chat-Regeln führt keine KI-Anfragen aus. Eine echte Abo-Auswertung kann erst nach erfolgreicher Benutzeranmeldung geprüft werden.
+Der Scheduler überspringt Kanäle mit vollem Clip-Budget oder aktivem Clip-Abstand bereits **vor** Transkription und Bildextraktion. Anfrage-Pacing verteilt das Stundenbudget über die Stunde, die fälligen Kanäle wechseln nach letzter Auswertung. Bei acht KI-Kanälen und 20 Anfragen/h ergibt das rechnerisch einen Abstand von mindestens 24 Minuten pro Kanal; ein Zwei-Minuten-Kontext deckt diese Zeit nicht vollständig ab. Die Einstellungsseite zeigt aktive KI-Kanäle, Budget-Abstand und gemessene Vorbereitungs-/Inferenzzeit. Lokale Limits und Kanalschalter bleiben bewusst einstellbar.
+
+Die KI vergleicht Kandidaten und wählt höchstens einen abgeschlossenen neuen Moment pro Fenster, bevorzugt 15–60, zulässig 5–120 Sekunden. Aufbau, Pointe und unmittelbare Reaktion gehören zusammen; der normale Vor-/Nachlauf gilt hier nicht. Die Mindestbewertung ist ein subjektiver KI-Score, keine kalibrierte Wahrscheinlichkeit. Schon gesicherte Momente werden im Prompt ausgeschlossen und anschließend in der Datenbank dedupliziert. Optional fließen die letzten sechs bewerteten Clips desselben Kanals als Textbeispiele ein (Favorit/Daumen hoch bevorzugen, Daumen runter vermeiden); das ist kein Modelltraining. Clip-Abstand und Stundenlimit werden mit den Audio-/Chat-Triggern geteilt. Reservierte Segmente bleiben bis zur Entscheidung verfügbar. Nach der Auswertung werden lokale Transkripte und Analysebilder entfernt; Diagnosen und Entscheidungen bleiben sieben Tage gespeichert. Die Historie ist pro Kanal abrufbar und zeigt konkrete Ablehnungsgründe sowie die KI-Begründung.
+
+**Grenzen:** Geschichten außerhalb des gewählten Kontextfensters, kurze Aktionen zwischen Keyframes und fehlerhaft transkribierte Sprache können übersehen werden. Ein Replay der Audio-/Chat-Regeln führt keine KI-Anfragen aus. Eine echte Abo-Auswertung kann erst nach erfolgreicher Benutzeranmeldung geprüft werden.
 
 Die Anfragezähler sind lokale Obergrenzen, nicht das verbleibende Wochenkontingent. Dessen Verbrauch hängt unter anderem von Modell und Eingabeumfang ab; den echten Stand zeigt [ChatGPT → Usage](https://chatgpt.com/settings/usage). Bei Kontingent-, Sitzungs- oder Inferenzfehlern pausiert die Analyse. Nach Behebung unter Einstellungen erneut speichern. Es gibt keinen automatischen Wechsel auf API-Abrechnung.
 
 Anmeldedaten liegen atomar geschrieben mit `0600` in `/data/auth/chatgpt.json`, das Verzeichnis hat `0700`. API und Worker serialisieren Token-Erneuerungen über eine PostgreSQL-Advisory-Lock. Die Datei enthält sensible Tokens und darf nicht veröffentlicht werden. Mehrere gespeicherte Konten sind möglich; Kontowechsel deaktiviert die Analyse und leert die Modellauswahl. **Trennen** entfernt lokale Tokens und versucht, die Sitzung bei OpenAI zu widerrufen.
 
 `CHATGPT_CALLBACK_URL` muss eine HTTP-Loopback-Adresse mit **127.0.0.1** sein. Compose setzt den Port passend zu `WEB_PORT`. Bei Remote-Hosting muss der Callback per lokalem Port-Forwarding erreichbar sein. Für einen lokalen Rust-Worker optional `WHISPER_BIN` und `WHISPER_MODEL` setzen; Standard: `whisper-cli` und `/opt/whisper/ggml-base.bin`.
+
+### Hochkant & Schnittliste
+
+Unter **Streamer → Kanal → Hochkant & Bearbeitung** den Spielausschnitt, die Facecam und den eingeblendeten Chat als Prozent-Rechtecke des Quellvideos einstellen. Die Vorschau verwendet das letzte fertige Clip-Vorschaubild. Facecam wahlweise oben oder unten (15–40% Höhe); Hauptbild vollständig mit schwarzen Rändern oder flächenfüllend beschnitten. Chat bleibt im Bild, wird geschwärzt oder bekommt ein separates Panel unten (20%). Das Chat-Panel übernimmt vorhandene Bildpixel, keine aus IRC rekonstruierten Nachrichten. Bei geändertem Stream-Layout muss das Profil angepasst werden.
+
+Am fertigen Clip **Zur Bearbeitung** wählen. Optional neue fertige Clips automatisch einreihen. Ein Auftrag speichert eine unveränderliche Kopie des Layouts; Doppelklicks erstellen keine parallelen Duplikate. Der Worker lädt das private Original aus S3, rendert ein separates **720×1280 / 30 fps / H.264 + AAC** MP4 und lädt es wieder hoch. In der **Schnittliste** sind Vorschau, Download und Wiederholung fehlgeschlagener Aufträge verfügbar. Höchstens ein Hochkant-Auftrag läuft gleichzeitig und teilt die Exportplätze mit normalen Clips. Unterbrochene Aufträge werden beim Neustart erneut eingeplant. Beim Löschen des Originals werden auch seine Hochkant-Dateien entfernt.
+
+### Jobs & Aktivitäten
+
+Oben rechts zeigt das Job-Icon laufende Aufnahmen, KI-Vorbereitung/Inferenz, Clip-Exporte und Hochkant-Aufträge sowie kürzlich abgeschlossene Jobs. Ein Klick öffnet das Schrittprotokoll; das Download-Icon exportiert die letzten bis zu 500 Einträge als `.log`. Enthalten sind Start, wichtige Verarbeitungsschritte, Abschluss und Fehler, keine OAuth-Tokens oder vollständigen Transkripte. Logs bleiben sieben Tage gespeichert. Wartende Aufträge erklären ihren Zustand über Status und KI-Limit-Anzeige. Die Glocke enthält die letzten 30 Aktivitäten; der Gelesen-Marker wird lokal im Browser gespeichert.
 
 ## Streamzugriff
 
@@ -149,6 +166,8 @@ backend/src/triggers.rs    Audio-Messung, Regelvalidierung und gemeinsame Live-/
 backend/src/chat.rs        Anonymer Twitch-IRC-Leser und Chat-Messwerte
 backend/src/chatgpt.rs     ChatGPT-Anmeldung, Tokenrotation und Modellkatalog
 backend/src/ai.rs          Transkription, Bildanalyse, Anfragebudget und semantische Clips
+backend/src/editing.rs     Layout-Profile, Hochkant-Filtergraph und persistente Schnittliste
+backend/src/jobs.rs        Laufende/letzte Jobs und strukturierte Schrittprotokolle
 backend/src/worker.rs      Supervisor, Exportjobs und Pufferbereinigung
 backend/src/storage.rs     S3-Uploads und signierte URLs
 backend/migrations/        Eingebettete SQLx-Migrationen

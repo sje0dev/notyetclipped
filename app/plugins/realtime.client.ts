@@ -11,6 +11,7 @@ export default defineNuxtPlugin((nuxtApp) => {
   let refreshTimer: ReturnType<typeof setTimeout> | undefined
   let attempts = 0
   let stopped = false
+  let lastOverview = 0
   const pending = new Set<string>()
 
   function schedule(keys: string[]) {
@@ -46,14 +47,20 @@ export default defineNuxtPlugin((nuxtApp) => {
         realtime.value = { connected: true, reconnecting: false, revision: realtime.value.revision + 1 }
       }
       if (event.type === 'resync') realtime.value.revision++
-      if (['hello', 'resync', 'system.updated'].includes(event.type)) schedule(['dashboard', 'streamers', 'clips', 'health', 'storage'])
-      else if (event.type === 'stream.updated') schedule(['dashboard', 'streamers', 'clips'])
+      if (['hello', 'resync'].includes(event.type)) schedule(['dashboard', 'streamers', 'clips', 'health', 'storage', 'ai', 'jobs', 'activities', 'edits'])
+      else if (event.type === 'system.updated') {
+        schedule(['health', 'jobs', 'activities'])
+        if (Date.now() - lastOverview >= 60000) { lastOverview = Date.now(); schedule(['dashboard', 'streamers', 'clips', 'storage']) }
+      }
+      else if (event.type === 'stream.updated') schedule(['dashboard', 'streamers', 'clips', 'activities', 'jobs'])
       else if (event.type === 'clip.updated') {
         clipEvent.value = { id: event.id || null, at: Date.now() }
-        schedule(['dashboard', 'clips', 'storage'])
+        schedule(['dashboard', 'clips', 'storage', 'activities', 'edits', 'jobs'])
       }
       else if (event.type === 'settings.updated') schedule(['dashboard', 'health'])
-      else if (event.type === 'ai.updated') schedule(['ai'])
+      else if (event.type === 'ai.updated') schedule(['ai', 'jobs', ...(event.id ? [`analyses-${event.id}`] : [])])
+      else if (event.type === 'edit.updated') schedule(['edits', 'jobs', 'activities', 'storage'])
+      else if (event.type === 'job.updated') schedule(['jobs'])
     }
     socket.onerror = () => socket?.close()
     socket.onclose = () => {

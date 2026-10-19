@@ -23,6 +23,21 @@ pub struct Semantic {
     pub interval_seconds: u32,
     pub min_confidence: f64,
     pub guidance: String,
+    pub exclusions: String,
+    pub context_seconds: u32,
+    pub language: String,
+    pub use_feedback: bool,
+    pub rules: Vec<ContentRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: String,
+    pub description: String,
 }
 
 impl Default for Semantic {
@@ -34,7 +49,53 @@ impl Default for Semantic {
             interval_seconds: 90,
             min_confidence: 0.8,
             guidance: String::new(),
+            exclusions: String::new(),
+            context_seconds: 120,
+            language: "auto".into(),
+            use_feedback: true,
+            rules: Vec::new(),
         }
+    }
+}
+
+impl Semantic {
+    pub fn needs_transcript(&self) -> bool {
+        self.stories || self.rules.iter().any(|r| r.enabled && r.kind == "story")
+    }
+
+    pub fn accepts(&self, kind: &str, trigger_id: &str) -> bool {
+        match trigger_id {
+            "story" | "" if kind == "story" => self.stories,
+            "visual" | "" if kind == "visual" => self.visual,
+            id => self
+                .rules
+                .iter()
+                .any(|r| r.enabled && r.id == id && r.kind == kind),
+        }
+    }
+
+    pub fn criteria(&self) -> Vec<ContentRule> {
+        let mut rules = self
+            .rules
+            .iter()
+            .filter(|r| r.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.stories {
+            rules.insert(0, ContentRule { id: "story".into(), name: "Stories & Gespräche".into(), enabled: true, kind: "story".into(), description: "Eigenständige Anekdoten, absurde Monologe, Pointen und interessante Gespräche mit Aufbau und Abschluss.".into() });
+        }
+        if self.visual {
+            rules.push(ContentRule {
+                id: "visual".into(),
+                name: "Video-Momente".into(),
+                enabled: true,
+                kind: "visual".into(),
+                description:
+                    "Belegte sichtbare Überraschungen, Reaktionen, Fails und körperliche Comedy."
+                        .into(),
+            });
+        }
+        rules
     }
 }
 
@@ -116,9 +177,32 @@ impl Profile {
         if !(30..=300).contains(&self.semantic.interval_seconds)
             || !(0.5..=1.0).contains(&self.semantic.min_confidence)
             || self.semantic.guidance.chars().count() > 1000
-            || (self.semantic.enabled && !self.semantic.stories && !self.semantic.visual)
+            || self.semantic.exclusions.chars().count() > 1000
+            || !(60..=180).contains(&self.semantic.context_seconds)
+            || !["auto", "de", "en"].contains(&self.semantic.language.as_str())
+            || (self.semantic.enabled && self.semantic.criteria().is_empty())
         {
-            return Err("Inhaltliche Trigger: mindestens eine Kategorie, Intervall 30–300s, Sicherheit 50–100% und maximal 1000 Zeichen Beschreibung.".into());
+            return Err("Inhaltliche Trigger: mindestens ein aktiver Auslöser, Intervall 30–300s, Kontext 60–180s, Bewertung 50–100% und maximal 1000 Zeichen je Beschreibung.".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        if self.semantic.rules.len() > 12
+            || self.semantic.rules.iter().any(|r| {
+                r.id.is_empty()
+                    || r.id.len() > 64
+                    || !r
+                        .id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    || ["story", "visual", "none"].contains(&r.id.as_str())
+                    || !ids.insert(&r.id)
+                    || r.name.trim().is_empty()
+                    || r.name.chars().count() > 60
+                    || r.description.trim().is_empty()
+                    || r.description.chars().count() > 1000
+                    || !["story", "visual"].contains(&r.kind.as_str())
+            })
+        {
+            return Err("Bis zu 12 Text-Trigger mit eindeutiger ID, Name (1–60 Zeichen), Kategorie story/visual und Beschreibung (1–1000 Zeichen) sind möglich.".into());
         }
         if self.version != 1
             || !(15..=180).contains(&self.warmup_seconds)

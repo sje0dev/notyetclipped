@@ -11,7 +11,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-RUN cargo build --release --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo build --release --locked && cp target/release/notyetclipped /app/notyetclipped
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg chromium python3-venv ca-certificates libgomp1 \
@@ -21,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg chromium
     && useradd --create-home --uid 10001 clipper \
     && mkdir /data && chown clipper:clipper /data
 ENV PATH="/opt/streamlink/bin:$PATH" DATA_DIR=/data API_BIND=0.0.0.0:8000
-COPY --from=build /app/target/release/notyetclipped /usr/local/bin/notyetclipped
+COPY --from=build /app/notyetclipped /usr/local/bin/notyetclipped
 COPY --from=whisper /src/build/bin/whisper-cli /usr/local/bin/whisper-cli
 COPY --from=whisper /src/models/ggml-base.bin /opt/whisper/ggml-base.bin
 USER clipper

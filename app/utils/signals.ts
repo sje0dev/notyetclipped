@@ -8,9 +8,16 @@ export function mergeSignals(previous: TriggerSignals | undefined, incoming: Tri
   if (previous.recording.id !== incoming.recording.id) {
     return incoming.recording.started_at >= previous.recording.started_at ? incoming : previous
   }
-  const frames = new Map(previous.frames.map(frame => [frame.time_ms, frame]))
-  incoming.frames.forEach(frame => frames.set(frame.time_ms, frame))
-  const ordered = [...frames.values()].sort((a, b) => a.time_ms - b.time_ms)
+  // Normal live batches append in order; avoid rebuilding/sorting a Map per channel/segment.
+  const append = incoming.frames.length && incoming.frames[0]!.time_ms > (previous.frames.at(-1)?.time_ms ?? -Infinity)
+    && incoming.frames.every((frame, i) => !i || frame.time_ms > incoming.frames[i - 1]!.time_ms)
+  let ordered: TriggerSignal[]
+  if (append) ordered = [...previous.frames, ...incoming.frames]
+  else {
+    const frames = new Map(previous.frames.map(frame => [frame.time_ms, frame]))
+    incoming.frames.forEach(frame => frames.set(frame.time_ms, frame))
+    ordered = [...frames.values()].sort((a, b) => a.time_ms - b.time_ms)
+  }
   const cutoff = (ordered.at(-1)?.time_ms || 0) - 300_000
   const newer = (incoming.recording.trigger_state.updated_at || '') >= (previous.recording.trigger_state.updated_at || '')
   return { ...(newer ? incoming : previous), frames: ordered.filter(frame => frame.time_ms > cutoff).slice(-1200) }
