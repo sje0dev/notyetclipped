@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -172,77 +171,6 @@ pub async fn render(
     Ok((video, thumbnail))
 }
 
-#[derive(Debug)]
-pub struct AudioHit {
-    pub time_ms: i64,
-    pub level_db: f64,
-    pub baseline_db: f64,
-    pub score: f64,
-}
-
-pub struct AudioDetector {
-    pub threshold_db: f64,
-    history: VecDeque<f64>,
-    last_trigger: i64,
-    sustained: usize,
-}
-
-impl AudioDetector {
-    pub fn new(threshold_db: f64) -> Self {
-        Self {
-            threshold_db,
-            history: VecDeque::new(),
-            last_trigger: -100_000,
-            sustained: 0,
-        }
-    }
-
-    pub fn feed(&mut self, pcm: &[i16], start_ms: i64) -> (Option<AudioHit>, Option<f64>) {
-        let mut hit = None;
-        let mut peak: Option<f64> = None;
-        for (index, window) in pcm.as_chunks::<4000>().0.iter().enumerate() {
-            let rms = (window
-                .iter()
-                .map(|&sample| (f64::from(sample) / 32768.0).powi(2))
-                .sum::<f64>()
-                / window.len() as f64)
-                .sqrt();
-            let level = (20.0 * rms.max(1e-8).log10()).max(-96.0);
-            peak = Some(peak.unwrap_or(-96.0).max(level));
-            let mut sorted: Vec<f64> = self.history.iter().copied().collect();
-            sorted.sort_by(f64::total_cmp);
-            let baseline = if sorted.is_empty() {
-                level
-            } else {
-                (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
-            };
-            self.sustained = if self.history.len() >= 48
-                && level > -28.0
-                && level - baseline >= self.threshold_db
-            {
-                self.sustained + 1
-            } else {
-                0
-            };
-            let time_ms = start_ms + index as i64 * 250;
-            if self.sustained >= 2 && time_ms - self.last_trigger >= 10_000 {
-                hit = Some(AudioHit {
-                    time_ms,
-                    level_db: level,
-                    baseline_db: baseline,
-                    score: (45.0 + (level - baseline) * 2.0).min(99.0),
-                });
-                self.last_trigger = time_ms;
-            }
-            self.history.push_back(level);
-            if self.history.len() > 240 {
-                self.history.pop_front();
-            }
-        }
-        (hit, peak)
-    }
-}
-
 pub fn overlaps(a: i64, b: i64, c: i64, d: i64) -> bool {
     a < d && b > c
 }
@@ -250,39 +178,6 @@ pub fn overlaps(a: i64, b: i64, c: i64, d: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn tone(seconds: f64, amplitude: f64) -> Vec<i16> {
-        (0..(seconds * 16000.0) as usize)
-            .map(|i| {
-                ((i as f64 / 16000.0 * 440.0 * std::f64::consts::TAU).sin() * amplitude * 32767.0)
-                    as i16
-            })
-            .collect()
-    }
-    #[test]
-    fn detects_sustained_reaction_after_warmup_and_debounces() {
-        let mut detector = AudioDetector::new(9.0);
-        assert!(detector.feed(&tone(16.0, 0.03), 0).0.is_none());
-        let hit = detector.feed(&tone(2.0, 0.5), 16000).0.unwrap();
-        assert_eq!(hit.time_ms, 16250);
-        assert!(hit.level_db - hit.baseline_db > 20.0);
-        assert!(detector.feed(&tone(2.0, 0.5), 18000).0.is_none());
-    }
-    #[test]
-    fn silence_loud_background_and_single_impulses_do_not_trigger() {
-        for amplitude in [0.0, 0.5] {
-            assert!(
-                AudioDetector::new(9.0)
-                    .feed(&tone(90.0, amplitude), 0)
-                    .0
-                    .is_none()
-            );
-        }
-        let mut detector = AudioDetector::new(9.0);
-        detector.feed(&tone(16.0, 0.02), 0);
-        let mut impulse = tone(0.25, 0.8);
-        impulse.extend(tone(0.75, 0.02));
-        assert!(detector.feed(&impulse, 16000).0.is_none());
-    }
     #[test]
     fn rejects_path_and_symlink_escapes() {
         let directory = tempfile::tempdir().unwrap();

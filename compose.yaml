@@ -9,6 +9,7 @@ x-backend-env: &backend-env
   S3_BUCKET: ${S3_BUCKET:-notyetclipped}
   S3_REGION: ${S3_REGION:-us-east-1}
   DATA_DIR: /data
+  CHATGPT_CALLBACK_URL: http://127.0.0.1:${WEB_PORT:-3000}/api/ai/callback
 
 services:
   postgres:

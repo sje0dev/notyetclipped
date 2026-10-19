@@ -17,6 +17,7 @@ pub struct Streamer {
     pub post_roll: i32,
     pub threshold_db: f64,
     pub auto_clip: bool,
+    pub trigger_profile: sqlx::types::Json<crate::triggers::Profile>,
     pub status: String,
     pub last_error: Option<String>,
     pub next_check_at: Option<DateTime<Utc>>,
@@ -32,6 +33,7 @@ pub struct Recording {
     pub ended_at: Option<DateTime<Utc>>,
     pub latest_ms: i64,
     pub audio_db: Option<f64>,
+    pub trigger_state: Value,
     pub error: Option<String>,
 }
 
@@ -88,6 +90,7 @@ pub struct StreamerInput {
     pub post_roll: i32,
     pub threshold_db: f64,
     pub auto_clip: bool,
+    pub trigger_profile: crate::triggers::Profile,
 }
 
 impl Default for StreamerInput {
@@ -101,6 +104,7 @@ impl Default for StreamerInput {
             post_roll: 20,
             threshold_db: 9.0,
             auto_clip: true,
+            trigger_profile: crate::triggers::Profile::default(),
         }
     }
 }
@@ -149,7 +153,7 @@ impl StreamerInput {
         {
             return Err("Ungültige Einstellungen: Priorität 0–100, Vorlauf 5–90s, Nachlauf 5–60s, zusammen höchstens 120s, Audio-Schwelle 3–24 dB.".into());
         }
-        Ok(())
+        self.trigger_profile.validate()
     }
 }
 

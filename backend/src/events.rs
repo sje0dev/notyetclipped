@@ -11,7 +11,20 @@ use uuid::Uuid;
 use crate::state::State;
 
 pub async fn publish(pool: &PgPool, kind: &str, id: Option<Uuid>) {
-    let payload = json!({"type": kind, "id": id, "at": chrono::Utc::now()}).to_string();
+    publish_data(
+        pool,
+        json!({"type": kind, "id": id, "at": chrono::Utc::now()}),
+    )
+    .await;
+}
+
+pub async fn publish_data(pool: &PgPool, payload: serde_json::Value) {
+    let payload = payload.to_string();
+    // PostgreSQL NOTIFY payloads must stay below 8000 bytes.
+    if payload.len() >= 8000 {
+        tracing::warn!(bytes = payload.len(), "Event exceeds NOTIFY payload limit");
+        return;
+    }
     if let Err(error) = sqlx::query("SELECT pg_notify('studio_events', $1)")
         .bind(payload)
         .execute(pool)

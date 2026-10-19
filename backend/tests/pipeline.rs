@@ -112,8 +112,20 @@ impl Fixture {
         self.admin.close().await;
     }
     async fn streamer(&self) -> Streamer {
-        sqlx::query_as("INSERT INTO streamers(id,login,pre_roll,post_roll) VALUES ($1,'test_streamer',5,5) RETURNING *")
-            .bind(Uuid::new_v4()).fetch_one(&self.state.pool).await.unwrap()
+        let mut profile = notyetclipped::triggers::Profile {
+            warmup_seconds: 15,
+            ..Default::default()
+        };
+        profile.rules[0].name = "Audio fixture".into();
+        profile.rules[0].conditions.retain(|c| {
+            matches!(
+                c.metric,
+                notyetclipped::triggers::Metric::AudioRise
+                    | notyetclipped::triggers::Metric::AudioLevel
+            )
+        });
+        sqlx::query_as("INSERT INTO streamers(id,login,pre_roll,post_roll,trigger_profile) VALUES ($1,'test_streamer',5,5,$2) RETURNING *")
+            .bind(Uuid::new_v4()).bind(json!(profile)).fetch_one(&self.state.pool).await.unwrap()
     }
 }
 
@@ -192,7 +204,43 @@ async fn record_fixture(fixture: &mut Fixture) -> Uuid {
 #[ignore = "Requires TEST_DATABASE_URL, TEST_S3_ENDPOINT and FFmpeg"]
 async fn capture_detect_render_upload_download_delete() {
     let mut fixture = Fixture::new().await;
+    let mut live = sqlx::postgres::PgListener::connect_with(&fixture.state.pool)
+        .await
+        .unwrap();
+    live.listen("studio_events").await.unwrap();
     let id = record_fixture(&mut fixture).await;
+    let stored: Vec<Value> =
+        sqlx::query_scalar("SELECT frames FROM trigger_samples ORDER BY start_ms")
+            .fetch_all(&fixture.state.pool)
+            .await
+            .unwrap();
+    let expected: Vec<Value> = stored
+        .into_iter()
+        .flat_map(|value| value.as_array().unwrap().clone())
+        .collect();
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut frames = Vec::new();
+        while frames.len() < expected.len() {
+            let notification = live.recv().await.unwrap();
+            assert!(notification.payload().len() < 8000);
+            let event: Value = serde_json::from_str(notification.payload()).unwrap();
+            if event["type"] == "signals.updated" {
+                let batch = event["frames"].as_array().unwrap();
+                assert!(batch.len() <= 8);
+                assert!(event["recording"]["trigger_state"]["updated_at"].is_string());
+                frames.extend(batch.iter().cloned());
+            }
+        }
+        frames
+    })
+    .await
+    .unwrap();
+    assert!(!expected.is_empty());
+    assert_eq!(
+        delivered, expected,
+        "All stored measurements must also be pushed, in order"
+    );
+    drop(live);
     sqlx::query("UPDATE clips SET attempts=1,status='cutting' WHERE id=$1")
         .bind(id)
         .execute(&fixture.state.pool)
@@ -523,6 +571,168 @@ async fn api_mutations_publish_postgres_events_over_websocket() {
         .unwrap();
     assert_eq!(dashboard["stats"]["clips_today"], 0);
     assert_eq!(dashboard["streamers"].as_array().unwrap().len(), 1);
+    assert_eq!(dashboard["trend"].as_array().unwrap().len(), 7);
+    assert!(
+        dashboard["trend"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|day| day["automatic"] == 0 && day["manual"] == 0)
+    );
+    // Roundtrip a real builder profile, then atomically copy only trigger-related fields.
+    let mut profile = notyetclipped::triggers::Profile::default();
+    profile.rules[0].name = "Test reaction".into();
+    let result = client
+        .patch(format!("{url}/streamers/{id}"))
+        .header("x-requested-with", "notyetclipped")
+        .json(&json!({"trigger_profile":profile,"pre_roll":15,"post_roll":10}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), 200);
+    let target: Value = client
+        .post(format!("{url}/streamers"))
+        .header("x-requested-with", "notyetclipped")
+        .json(&json!({"login":"target_channel","enabled":false,"auto_clip":false,"quality":"best"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let target_id = target["id"].as_str().unwrap();
+    let copy = client
+        .post(format!("{url}/streamers/{id}/triggers/copy"))
+        .header("x-requested-with", "notyetclipped");
+    assert_eq!(
+        copy.try_clone()
+            .unwrap()
+            .json(&json!({"target_ids":[target_id, Uuid::new_v4().to_string()]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let unchanged: Streamer = sqlx::query_as("SELECT * FROM streamers WHERE id=$1")
+        .bind(Uuid::parse_str(target_id).unwrap())
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged.pre_roll, 30,
+        "An invalid target must roll back the entire copy"
+    );
+    assert_eq!(
+        copy.json(&json!({"target_ids":[target_id]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let copied: Streamer = sqlx::query_as("SELECT * FROM streamers WHERE id=$1")
+        .bind(Uuid::parse_str(target_id).unwrap())
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(copied.trigger_profile.0, profile);
+    assert_eq!((copied.pre_roll, copied.post_roll), (15, 10));
+    assert!(!copied.auto_clip && !copied.enabled);
+    assert_eq!(copied.quality, "best");
+    let recording_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO recordings(id,streamer_id) VALUES ($1,$2)")
+        .bind(recording_id)
+        .bind(Uuid::parse_str(id).unwrap())
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+    let frames: Vec<_> = (0..4000)
+        .step_by(250)
+        .map(|time_ms| notyetclipped::triggers::Signal {
+            time_ms,
+            audio_level: -12.0,
+            audio_rise: 15.0,
+            calibrated_seconds: 65.0,
+            chat_messages: Some(10.0),
+            chat_users: Some(5.0),
+            ..Default::default()
+        })
+        .collect();
+    sqlx::query("INSERT INTO trigger_samples(recording_id,start_ms,frames) VALUES ($1,0,$2)")
+        .bind(recording_id)
+        .bind(json!(frames))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+    let history: Value = client
+        .get(format!("{url}/streamers/{id}/signals"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(history["recording"]["id"], recording_id.to_string());
+    assert_eq!(
+        history["frames"],
+        json!(frames),
+        "History must retain full-resolution reference samples"
+    );
+    let pushed = json!({"type":"signals.updated","id":id,"recording":history["recording"],"frames":&frames[..8],"hourly_count":0,"last_trigger_at":null});
+    events::publish_data(&fixture.state.pool, pushed.clone()).await;
+    let received = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            if message.is_text() {
+                let event: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                if event["type"] == "signals.updated" {
+                    break event;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        received, pushed,
+        "WebSockets deliver measurement data without HTTP invalidation"
+    );
+    let result: Value = client
+        .post(format!("{url}/streamers/{id}/triggers/test"))
+        .header("x-requested-with", "notyetclipped")
+        .json(&profile)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(result["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(result["hits"][0]["rule"], "Test reaction");
+    let clips: i64 = sqlx::query_scalar("SELECT count(*) FROM clips")
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(clips, 0, "Dry runs must never reserve clips");
+    profile.rules[0].conditions.clear();
+    assert_eq!(
+        client
+            .patch(format!("{url}/streamers/{id}"))
+            .header("x-requested-with", "notyetclipped")
+            .json(&json!({"trigger_profile":profile}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
     socket.close(None).await.unwrap();
     listener.abort();
     handle.stop(false).await;
@@ -552,4 +762,265 @@ async fn csv_reader_does_not_consume_partial_lines() {
         offset: rows[0].next_offset,
     };
     assert!(reader.read(directory.path()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL, FFmpeg and S3 test services"]
+async fn semantic_clips_keep_context_pins_budgets_and_deleted_clip_deduplication() {
+    use notyetclipped::ai::{self, Decision, Run};
+    let fixture = Fixture::new().await;
+    let state = &fixture.state;
+    let mut streamer = fixture.streamer().await;
+    streamer.trigger_profile.semantic.enabled = true;
+    sqlx::query("UPDATE streamers SET trigger_profile=$2 WHERE id=$1")
+        .bind(streamer.id)
+        .bind(json!(streamer.trigger_profile))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ai_control SET settings=jsonb_set(settings,'{enabled}','true') WHERE id=1")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let source = generate_source(state).await;
+    let recording: Recording = sqlx::query_as("INSERT INTO recordings(id,streamer_id,latest_ms,ended_at) VALUES ($1,$2,24000,now()) RETURNING *").bind(Uuid::new_v4()).bind(streamer.id).fetch_one(&state.pool).await.unwrap();
+    let relative = source
+        .strip_prefix(&state.config.data_dir)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    sqlx::query("INSERT INTO segments(recording_id,path,start_ms,end_ms,size_bytes) VALUES ($1,$2,0,24000,1000)").bind(recording.id).bind(relative).execute(&state.pool).await.unwrap();
+    let run: Run = sqlx::query_as("INSERT INTO ai_runs(id,recording_id,streamer_id,start_ms,end_ms,sent_at) VALUES ($1,$2,$3,0,24000,now()) RETURNING *").bind(Uuid::new_v4()).bind(recording.id).bind(streamer.id).fetch_one(&state.pool).await.unwrap();
+    worker::clean_buffers(state, 180).await.unwrap();
+    assert!(
+        source.is_file(),
+        "In-flight analysis must pin even an ended recording"
+    );
+    let input = ai::prepare(
+        state,
+        &run,
+        &state.config.data_dir.join("analysis-test"),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(input.iter().filter(|v| v["type"] == "input_image").count() >= 2);
+    let mut decision = Decision {
+        highlight: true,
+        kind: "story".into(),
+        start_seconds: 2.,
+        end_seconds: 18.,
+        confidence: 0.9,
+        title: "Testgeschichte".into(),
+        reason: "Anfang und Pointe".into(),
+    };
+    let profile = &streamer.trigger_profile.semantic;
+    let mut edited = profile.clone();
+    edited.guidance = "changed".into();
+    assert!(
+        ai::apply_decision(state, &run, &decision, &edited)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query(
+        "UPDATE ai_control SET settings=jsonb_set(settings,'{enabled}','false') WHERE id=1",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    assert!(
+        ai::apply_decision(state, &run, &decision, profile)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE ai_control SET settings=jsonb_set(settings,'{enabled}','true') WHERE id=1")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    decision.confidence = 0.6;
+    assert!(
+        ai::apply_decision(state, &run, &decision, profile)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    decision.confidence = 0.9;
+    let id = ai::apply_decision(state, &run, &decision, profile)
+        .await
+        .unwrap()
+        .unwrap();
+    let clip: Clip = sqlx::query_as("SELECT * FROM clips WHERE id=$1")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (clip.start_ms, clip.end_ms),
+        (2000, 18000),
+        "Use semantic bounds, not generic pre/post-roll"
+    );
+    assert_eq!(clip.status, "queued");
+    assert_eq!(clip.trigger, "story");
+    assert!(
+        ai::apply_decision(state, &run, &decision, profile)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("DELETE FROM clips WHERE id=$1")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM trigger_events WHERE streamer_id=$1")
+        .bind(streamer.id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "Deleting a clip must not refund its trigger budget"
+    );
+    sqlx::query("UPDATE trigger_events SET created_at=now()-interval '10 minutes'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert!(
+        ai::apply_decision(state, &run, &decision, profile)
+            .await
+            .unwrap()
+            .is_none(),
+        "Completed moments stay deduplicated after clip deletion and cooldown"
+    );
+    assert_eq!(ai::status(state).await.unwrap()["requests_day"], 1);
+    worker::clean_buffers(state, 180).await.unwrap();
+    assert!(
+        !source.exists(),
+        "Completed analysis must release its source pin"
+    );
+    fixture.clean().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL and S3 test services"]
+async fn semantic_scheduler_respects_pause_request_budgets_and_new_footage() {
+    use notyetclipped::ai;
+    let fixture = Fixture::new().await;
+    let state = &fixture.state;
+    let mut streamer = fixture.streamer().await;
+    streamer.trigger_profile.semantic.enabled = true;
+    sqlx::query("UPDATE streamers SET trigger_profile=$2 WHERE id=$1")
+        .bind(streamer.id)
+        .bind(json!(streamer.trigger_profile))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO recordings(id,streamer_id,latest_ms) VALUES ($1,$2,40000)")
+        .bind(id)
+        .bind(streamer.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO segments(recording_id,path,start_ms,end_ms,size_bytes) VALUES ($1,'sample.ts',0,40000,1000)").bind(id).execute(&state.pool).await.unwrap();
+    assert!(
+        ai::reserve(state).await.unwrap().is_none(),
+        "Global analysis starts disabled"
+    );
+    sqlx::query("UPDATE ai_control SET settings=$1 WHERE id=1")
+        .bind(json!({"enabled":true,"model":"test","hourly_limit":1,"daily_limit":2}))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (run, _) = ai::reserve(state).await.unwrap().unwrap();
+    assert_eq!((run.start_ms, run.end_ms), (0, 40000));
+    assert!(
+        ai::reserve(state).await.unwrap().is_none(),
+        "Respect per-channel intervals"
+    );
+    sqlx::query(
+        "UPDATE ai_runs SET created_at=now()-interval '10 minutes',status='skipped' WHERE id=$1",
+    )
+    .bind(run.id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    assert!(
+        ai::reserve(state).await.unwrap().is_none(),
+        "A stalled stream must not spend requests on the same footage"
+    );
+    sqlx::query("UPDATE recordings SET latest_ms=60000 WHERE id=$1")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ai_runs SET sent_at=now() WHERE id=$1")
+        .bind(run.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert!(
+        ai::reserve(state).await.unwrap().is_none(),
+        "Request admission counts persisted sends"
+    );
+    sqlx::query("UPDATE ai_runs SET sent_at=now()-interval '2 hours' WHERE id=$1")
+        .bind(run.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ai_control SET paused_reason='quota' WHERE id=1")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert!(
+        ai::reserve(state).await.unwrap().is_none(),
+        "Quota pause prevents preparing more work"
+    );
+    sqlx::query("UPDATE ai_control SET paused_reason=NULL WHERE id=1")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    assert!(ai::reserve(state).await.unwrap().is_some());
+    fixture.clean().await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL and S3 test services"]
+async fn chatgpt_login_uses_pkce_stable_host_and_single_use_state_without_exposing_secrets() {
+    use notyetclipped::chatgpt;
+    let fixture = Fixture::new().await;
+    let state = &fixture.state;
+    let url = url::Url::parse(&chatgpt::login(state, None).await.unwrap()).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(url.host_str(), Some("auth.openai.com"));
+    assert_eq!(query["client_id"], "dynamic_agent_client");
+    assert_eq!(query["code_challenge_method"], "S256");
+    assert!(query["scope"].contains("chatgpt.tokens.use.direct"));
+    let path = state.config.data_dir.join("auth/chatgpt.json");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let invalid = serde_json::from_value(json!({"state":"wrong","error":"access_denied"})).unwrap();
+    assert!(chatgpt::callback(state, invalid).await.is_err());
+    let denied =
+        serde_json::from_value(json!({"state":query["state"],"error":"access_denied"})).unwrap();
+    assert!(chatgpt::callback(state, denied).await.is_err());
+    let vault: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(vault["pending"].is_null(), "A denied attempt is single-use");
+    let next = url::Url::parse(&chatgpt::login(state, None).await.unwrap()).unwrap();
+    let next: std::collections::HashMap<_, _> = next.query_pairs().into_owned().collect();
+    assert_eq!(query["ext_agent_host_id"], next["ext_agent_host_id"]);
+    assert_ne!(query["state"], next["state"]);
+    assert_ne!(query["code_challenge"], next["code_challenge"]);
+    let status = chatgpt::status(state).await.unwrap().to_string();
+    assert!(
+        !status.contains("verifier")
+            && !status.contains(&next["state"])
+            && !status.contains("access_token")
+    );
+    assert!(chatgpt::access_token(state).await.is_err());
+    fixture.clean().await;
 }

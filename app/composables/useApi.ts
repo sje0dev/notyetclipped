@@ -10,7 +10,11 @@ export function api<T>(path: string, options: NitroFetchOptions<string> = {}) {
 }
 
 export function useRealtimeState() {
-  return useState('realtime', () => ({ connected: false, reconnecting: false }))
+  return useState('realtime', () => ({ connected: false, reconnecting: false, revision: 0 }))
+}
+
+export function useSignalFeed() {
+  return useState<Record<string, import('~/types').TriggerSignals>>('signal-feed', () => ({}))
 }
 
 export function usePolling(callback: () => unknown, interval = 15000, fallbackOnly = true) {

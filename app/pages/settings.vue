@@ -2,13 +2,18 @@
 import { Save, LoaderCircle, Cpu, Database, HardDrive, Cloud, Check, CircleAlert, RefreshCw, Info, AudioLines } from '@lucide/vue'
 import type { Settings, Health } from '~/types'
 const { data, error, refresh } = await useFetch<Settings>('/api/settings', { key: 'settings', timeout: 8000 })
-const { data: health, refresh: refreshHealth } = await useFetch<Health>('/api/health', { key: 'health', timeout: 7000, server: false })
+const { data: healthData, refresh: refreshHealth } = await useFetch<Health>('/api/health', { key: 'health', timeout: 7000, server: false })
+const mounted = ref(false)
+onMounted(() => { mounted.value = true })
+const health = computed(() => mounted.value ? healthData.value : undefined)
 const { data: storageInfo, refresh: refreshStorage } = await useFetch<{ bucket: string; stored_bytes: number; buffer_bytes: number; disk_free_bytes: number; disk_total_bytes: number }>('/api/storage', { key: 'storage', timeout: 8000 })
 const form = reactive<Settings>({ max_recordings: 4, max_exports: 2, buffer_seconds: 300, scratch_budget_gb: 20, min_free_disk_gb: 2, offline_poll_seconds: 90, retention_days: 0 })
 watch(data, value => { if (value) Object.assign(form, value) }, { immediate: true })
 const { toast } = useToast()
 const busy = ref(false)
 const saveError = ref('')
+const route = useRoute()
+const tab = ref(route.query.tab === 'ai' || route.query.chatgpt ? 'ai' : 'system')
 async function save() {
   busy.value = true
   saveError.value = ''
@@ -20,7 +25,10 @@ async function checkConnections() { await Promise.all([refreshHealth(), refreshS
 </script>
 <template>
   <div>
-    <div class="mb-8"><p class="eyebrow mb-2">Make It Yours</p><h1 class="page-title">Dein Studio, deine Regeln<span class="text-lime-300">.</span></h1><p class="mt-2 text-sm text-studio-400">Ressourcen verteilen, Puffer abstimmen und Speicher im Blick behalten.</p></div>
+    <div class="mb-7"><h1 class="page-title">Einstellungen</h1><p class="mt-2 text-sm text-studio-400">Aufnahmeleistung, Puffer und Speicher für deinen Workspace.</p></div>
+    <nav class="tab-bar mb-7" aria-label="Einstellungsbereiche"><button class="tab" :class="{ 'tab-active': tab === 'system' }" :aria-pressed="tab === 'system'" @click="tab = 'system'">Aufnahme & Speicher</button><button class="tab" :class="{ 'tab-active': tab === 'ai' }" :aria-pressed="tab === 'ai'" @click="tab = 'ai'">ChatGPT & KI-Analyse</button></nav>
+    <AiSettings v-if="tab === 'ai'" />
+    <div v-show="tab === 'system'">
     <ConnectionError v-if="error" @retry="checkConnections" />
     <div v-else class="grid items-start gap-6 xl:grid-cols-[1fr_320px]">
       <form class="space-y-6" @submit.prevent="save">
@@ -31,9 +39,10 @@ async function checkConnections() { await Promise.all([refreshHealth(), refreshS
       </form>
       <div class="space-y-5"><section class="panel p-5"><div class="mb-5 flex items-center justify-between"><h2 class="text-sm font-semibold">Verbindungen</h2><button class="icon-btn" aria-label="Verbindungen prüfen" @click="checkConnections"><RefreshCw :size="14" /></button></div><div class="space-y-4"><div v-for="service in [{ key: 'database' as const, label: 'PostgreSQL', sub: 'Metadaten & Aufträge', icon: Database }, { key: 'storage' as const, label: 'S3 Bucket', sub: health?.bucket || 'Dateispeicher', icon: Cloud }, { key: 'worker' as const, label: 'Capture Worker', sub: 'Streamlink + FFmpeg', icon: Cpu }]" :key="service.key" class="flex items-center gap-3"><span class="flex size-9 items-center justify-center rounded-lg bg-studio-800 text-studio-400"><component :is="service.icon" :size="16" /></span><div class="min-w-0 flex-1"><p class="text-xs font-medium">{{ service.label }}</p><p class="mt-1 truncate text-[10px] text-studio-400">{{ service.sub }}</p></div><Check v-if="health?.[service.key]" :size="15" class="text-lime-300" /><CircleAlert v-else :size="15" class="text-amber-200" /></div></div><p class="hint mt-5 border-t divider pt-4">Zugangsdaten und Endpoints werden über die <code class="text-zinc-300">.env</code>-Datei auf dem Server konfiguriert.</p></section>
         <section v-if="storageInfo" class="panel p-5"><h2 class="mb-5 text-sm font-semibold">Speicher im Überblick</h2><dl class="space-y-4 text-xs"><div class="flex justify-between"><dt class="text-studio-400">Clips in S3</dt><dd class="font-mono">{{ bytes(storageInfo.stored_bytes) }}</dd></div><div class="flex justify-between"><dt class="text-studio-400">Videopuffer</dt><dd class="font-mono">{{ bytes(storageInfo.buffer_bytes) }}</dd></div><div class="flex justify-between border-t divider pt-4"><dt class="text-studio-400">Lokal verfügbar</dt><dd class="font-mono text-lime-300">{{ bytes(storageInfo.disk_free_bytes) }}</dd></div></dl></section>
-        <section class="rounded-xl border border-lime-300/15 bg-lime-300/3 p-5"><AudioLines :size="20" class="mb-3 text-lime-300" /><h3 class="text-sm font-medium">Auf jeden Kanal abgestimmt.</h3><p class="mt-2 text-xs leading-relaxed text-studio-400">Audio-Schwelle, Aufnahmequalität und Clip-Vor-/Nachlauf stellst du pro Streamer ein.</p><NuxtLink to="/streamers" class="mt-4 inline-block text-xs font-medium text-lime-300">Zur Watchlist →</NuxtLink></section>
+        <section class="panel p-5"><AudioLines :size="20" class="mb-3 text-studio-400" /><h3 class="text-sm font-medium">Trigger pro Streamer</h3><p class="mt-2 text-xs leading-relaxed text-studio-400">Audio und Chat kombinieren, Clip-Länge anpassen und Regeln auf weitere Kanäle kopieren.</p><NuxtLink to="/triggers" class="mt-4 inline-block text-xs font-medium text-zinc-200">Automationen öffnen →</NuxtLink></section>
         <p class="flex gap-2 px-1 text-[10px] leading-relaxed text-studio-400"><Info :size="13" class="mt-0.5 shrink-0" />Der Kernbetrieb verwendet die Stream-Auflösung von Streamlink. Eine eigene Twitch-Helix-Anbindung ist nicht erforderlich.</p>
       </div>
+    </div>
     </div>
   </div>
 </template>

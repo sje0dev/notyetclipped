@@ -20,11 +20,13 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    chat::Chat,
     events,
-    media::{AudioDetector, decode_audio, tail},
+    media::{decode_audio, tail},
     models::{Recording, Streamer},
     services,
     state::State,
+    triggers::{Analyzer, Engine},
 };
 
 struct ProcessGroup {
@@ -87,6 +89,7 @@ impl Capture {
                     "0",
                     "--twitch-supported-codecs",
                     "h264",
+                    "--twitch-low-latency",
                     "--webbrowser-headless",
                     "yes",
                     "--ffmpeg-ffmpeg",
@@ -122,7 +125,7 @@ impl Capture {
                     "-f",
                     "segment",
                     "-segment_time",
-                    "4",
+                    "2",
                     "-segment_format",
                     "mpegts",
                     "-reset_timestamps",
@@ -249,7 +252,9 @@ struct Ingest {
     streamer_id: Uuid,
     directory: PathBuf,
     reader: IndexReader,
-    detector: AudioDetector,
+    analyzer: Analyzer,
+    engine: Engine,
+    chat: Option<Chat>,
     got_segment: bool,
     last_segment: Instant,
 }
@@ -280,7 +285,8 @@ impl Ingest {
             .bind(self.streamer_id)
             .fetch_one(&mut *tx)
             .await?;
-            if !self.got_segment {
+            let first_segment = !self.got_segment;
+            if first_segment {
                 services::activity(
                     &mut tx,
                     "recording",
@@ -294,51 +300,115 @@ impl Ingest {
             self.reader.offset = segment.next_offset;
             self.got_segment = true;
             self.last_segment = Instant::now();
-            self.detector.threshold_db = streamer.threshold_db;
+            if streamer.trigger_profile.uses_chat() && self.chat.is_none() {
+                self.chat = Some(Chat::start(streamer.login.clone()));
+            } else if !streamer.trigger_profile.uses_chat() {
+                self.chat = None;
+            }
             if analyze {
                 let _permit = semaphore.acquire().await?;
+                let observed_at = Instant::now();
                 match decode_audio(&state.config, &segment.path).await {
                     Ok(pcm) => {
-                        let (hit, level) = self.detector.feed(&pcm, segment.start);
+                        let mut frames = self.analyzer.feed(&pcm, segment.start);
+                        if let Some(chat) = &self.chat {
+                            let mut metrics = chat.metrics.lock().await;
+                            for frame in &mut frames {
+                                // Do not count a newly arriving chat burst as sustained for the entire segment.
+                                let at = observed_at
+                                    - Duration::from_millis(
+                                        (segment.end - frame.time_ms).max(0) as u64
+                                    );
+                                let (messages, users, rate) = metrics.snapshot_at(at);
+                                frame.chat_messages = messages;
+                                frame.chat_users = users;
+                                frame.chat_rate = rate;
+                            }
+                        }
+                        let level = frames.iter().map(|s| s.audio_level).reduce(f64::max);
                         let mut tx = state.pool.begin().await?;
                         let _: Recording =
                             sqlx::query_as("SELECT * FROM recordings WHERE id=$1 FOR UPDATE")
                                 .bind(self.id)
                                 .fetch_one(&mut *tx)
                                 .await?;
-                        sqlx::query("UPDATE recordings SET audio_db=$2 WHERE id=$1")
-                            .bind(self.id)
-                            .bind(level)
-                            .execute(&mut *tx)
-                            .await?;
-                        if let Some(hit) = hit
-                            && streamer.auto_clip
-                            && streamer.enabled
-                            && streamer.deleted_at.is_none()
-                        {
-                            services::create_clip(
-                                &mut tx,
-                                &streamer,
-                                &recording,
-                                hit.time_ms,
-                                "audio",
-                                hit.score,
-                                &format!(
-                                    "Audio-Spitze: {:.1} dB über dem Kanal-Normalpegel.",
-                                    hit.level_db - hit.baseline_db
-                                ),
-                            )
-                            .await?;
-                            services::finalize_pending(&mut tx, &recording).await?;
+                        // Re-read configuration under lock so disabling auto-clips takes effect immediately.
+                        let streamer: Streamer =
+                            sqlx::query_as("SELECT * FROM streamers WHERE id=$1 FOR UPDATE")
+                                .bind(self.streamer_id)
+                                .fetch_one(&mut *tx)
+                                .await?;
+                        let mut last_hit = None;
+                        for frame in &frames {
+                            let hit = self.engine.evaluate(&streamer.trigger_profile, frame);
+                            if let Some(hit) = hit
+                                && streamer.auto_clip
+                                && streamer.enabled
+                                && streamer.deleted_at.is_none()
+                            {
+                                let (count, cooling): (i64, bool) = sqlx::query_as("SELECT count(*),coalesce(bool_or(created_at > now()-($2 * interval '1 second')),false) FROM trigger_events WHERE streamer_id=$1 AND created_at > now()-interval '1 hour'")
+                                    .bind(streamer.id).bind(f64::from(streamer.trigger_profile.cooldown_seconds)).fetch_one(&mut *tx).await?;
+                                if count < streamer.trigger_profile.hourly_limit as i64 && !cooling
+                                {
+                                    services::create_clip(
+                                        &mut tx,
+                                        &streamer,
+                                        &recording,
+                                        hit.time_ms,
+                                        "rule",
+                                        0.0,
+                                        &hit.reason,
+                                    )
+                                    .await?;
+                                    sqlx::query(
+                                        "INSERT INTO trigger_events(streamer_id) VALUES ($1)",
+                                    )
+                                    .bind(streamer.id)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                    last_hit = Some(hit);
+                                }
+                            }
                         }
+                        let snapshot = json!({"signal":frames.last(),"last_hit":last_hit,"updated_at":chrono::Utc::now()});
+                        sqlx::query(
+                            "UPDATE recordings SET audio_db=$2,trigger_state=$3 WHERE id=$1",
+                        )
+                        .bind(self.id)
+                        .bind(level)
+                        .bind(&snapshot)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query("INSERT INTO trigger_samples(recording_id,start_ms,frames) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+                            .bind(self.id).bind(segment.start).bind(json!(frames)).execute(&mut *tx).await?;
+                        services::finalize_pending(&mut tx, &recording).await?;
                         tx.commit().await?;
+                        let (count, last): (i64, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as("SELECT count(*),max(created_at) FROM trigger_events WHERE streamer_id=$1 AND created_at > now()-interval '1 hour'")
+                            .bind(self.streamer_id).fetch_one(&state.pool).await?;
+                        let buffer_seconds: i64 = sqlx::query_scalar("SELECT coalesce((max(end_ms)-min(start_ms))/1000,0) FROM segments WHERE recording_id=$1")
+                            .bind(self.id).fetch_one(&state.pool).await?;
+                        // Push the actual measurements, in bounded chunks even for long GOPs.
+                        // Clients no longer need an HTTP fetch after each segment.
+                        for chunk in frames.chunks(8) {
+                            events::publish_data(&state.pool, json!({
+                                "type":"signals.updated", "id":self.streamer_id,
+                                "recording":{"id":self.id,"started_at":recording.started_at,"ended_at":null,"trigger_state":snapshot},
+                                "frames":chunk,"hourly_count":count,"last_trigger_at":last,
+                                "audio_db":level,"buffer_seconds":buffer_seconds,
+                            })).await;
+                        }
+                        if last_hit.is_some() {
+                            events::publish(&state.pool, "clip.updated", None).await;
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(%error, streamer=%streamer.login, "Audioanalyse fehlgeschlagen")
                     }
                 }
             }
-            events::publish(&state.pool, "stream.updated", Some(self.streamer_id)).await;
+            if first_segment || !analyze {
+                events::publish(&state.pool, "stream.updated", Some(self.streamer_id)).await;
+            }
         }
         Ok(())
     }
@@ -374,7 +444,13 @@ pub async fn run(
         streamer_id: streamer.id,
         directory: directory.clone(),
         reader: IndexReader { offset: 0 },
-        detector: AudioDetector::new(streamer.threshold_db),
+        analyzer: Analyzer::default(),
+        engine: Engine::default(),
+        chat: if streamer.trigger_profile.uses_chat() {
+            Some(Chat::start(streamer.login.clone()))
+        } else {
+            None
+        },
         got_segment: false,
         last_segment: Instant::now(),
     };
@@ -387,7 +463,7 @@ pub async fn run(
             ingest.run(&state, true, &semaphore).await?;
             if capture.ffmpeg.child.try_wait()?.is_some() { break; }
             anyhow::ensure!(ingest.last_segment.elapsed() < Duration::from_secs(120), "Seit 120 Sekunden keine neuen Videosegmente empfangen.");
-            tokio::select! { _ = tokio::time::sleep(Duration::from_secs(1)) => {}, _ = stop.changed() => break }
+            tokio::select! { _ = tokio::time::sleep(Duration::from_millis(250)) => {}, _ = stop.changed() => break }
         }
         Ok(())
     }.await;

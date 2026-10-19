@@ -13,6 +13,9 @@ pub struct Config {
     pub ffmpeg: String,
     pub streamlink: String,
     pub bind: String,
+    pub chatgpt_callback: String,
+    pub whisper: String,
+    pub whisper_model: PathBuf,
 }
 
 fn value(key: &str, default: &str) -> String {
@@ -41,6 +44,12 @@ impl Config {
             ffmpeg: value("FFMPEG_BIN", "ffmpeg"),
             streamlink: value("STREAMLINK_BIN", "streamlink"),
             bind: value("API_BIND", "127.0.0.1:8000"),
+            chatgpt_callback: value(
+                "CHATGPT_CALLBACK_URL",
+                "http://127.0.0.1:3000/api/ai/callback",
+            ),
+            whisper: value("WHISPER_BIN", "whisper-cli"),
+            whisper_model: value("WHISPER_MODEL", "/opt/whisper/ggml-base.bin").into(),
         })
     }
 }

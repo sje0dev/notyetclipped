@@ -11,12 +11,14 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::{
+    ai, chatgpt,
     error::{ApiError, conflict, invalid, missing},
     events,
     media::safe_path,
     models::{ACTIVE, Clip, ManifestEntry, Recording, Settings, Streamer, StreamerInput},
     services,
     state::State,
+    triggers::{Engine, Profile, Signal},
 };
 
 type Response = Result<web::Json<Value>, ApiError>;
@@ -57,7 +59,7 @@ pub async fn serve(state: State) -> anyhow::Result<()> {
                     }),
             )
             .wrap(middleware::DefaultHeaders::new().add(("Cache-Control", "no-store")))
-            .wrap(middleware::Logger::default())
+            .wrap(middleware::Logger::default().exclude("/api/ai/callback"))
             .configure(routes)
     })
     .bind(bind)?
@@ -71,6 +73,12 @@ pub fn routes(config: &mut web::ServiceConfig) {
         web::scope("/api")
             .route("/ping", web::get().to(ping))
             .route("/health", web::get().to(health))
+            .route("/ai", web::get().to(ai_status))
+            .route("/ai/settings", web::put().to(ai_settings))
+            .route("/ai/login", web::post().to(ai_login))
+            .route("/ai/logout", web::post().to(ai_logout))
+            .route("/ai/callback", web::get().to(ai_callback))
+            .route("/ai/models", web::get().to(ai_models))
             .route("/ws", web::get().to(events::websocket))
             .route("/dashboard", web::get().to(dashboard))
             .route("/streamers", web::get().to(list_streamers))
@@ -78,6 +86,15 @@ pub fn routes(config: &mut web::ServiceConfig) {
             .route("/streamers/{id}", web::patch().to(update_streamer))
             .route("/streamers/{id}", web::delete().to(remove_streamer))
             .route("/streamers/{id}/clip", web::post().to(manual_clip))
+            .route("/streamers/{id}/signals", web::get().to(trigger_signals))
+            .route(
+                "/streamers/{id}/triggers/test",
+                web::post().to(test_triggers),
+            )
+            .route(
+                "/streamers/{id}/triggers/copy",
+                web::post().to(copy_triggers),
+            )
             .route("/clips", web::get().to(list_clips))
             .route("/clips/{id}", web::get().to(clip_detail))
             .route("/clips/{id}", web::patch().to(update_clip))
@@ -87,6 +104,76 @@ pub fn routes(config: &mut web::ServiceConfig) {
             .route("/settings", web::put().to(update_settings))
             .route("/storage", web::get().to(storage_info)),
     );
+}
+
+async fn ai_status(state: web::Data<State>) -> Response {
+    Ok(web::Json(ai::status(&state).await?))
+}
+
+async fn ai_models(state: web::Data<State>) -> Response {
+    Ok(web::Json(
+        chatgpt::models(&state)
+            .await
+            .map_err(|e| invalid(e.to_string()))?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    account_id: Option<String>,
+}
+
+async fn ai_login(
+    state: web::Data<State>,
+    input: web::Json<LoginRequest>,
+    _: ApplicationRequest,
+) -> Response {
+    let url = chatgpt::login(&state, input.account_id.as_deref())
+        .await
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(web::Json(json!({"url":url})))
+}
+
+async fn ai_logout(state: web::Data<State>, _: ApplicationRequest) -> Response {
+    Ok(web::Json(json!({"revoked":chatgpt::logout(&state).await?})))
+}
+
+async fn ai_callback(
+    state: web::Data<State>,
+    query: web::Query<chatgpt::Callback>,
+) -> HttpResponse {
+    match chatgpt::callback(&state, query.into_inner()).await {
+        Ok(()) => HttpResponse::SeeOther().insert_header(("Location", "/settings?chatgpt=connected")).finish(),
+        Err(error) => HttpResponse::BadRequest().content_type("text/plain; charset=utf-8").body(format!("ChatGPT-Anmeldung fehlgeschlagen: {error}\n\nBitte zu /settings zurückkehren und die Anmeldung erneut starten.")),
+    }
+}
+
+async fn ai_settings(
+    state: web::Data<State>,
+    input: web::Json<ai::Settings>,
+    _: ApplicationRequest,
+) -> Response {
+    input.validate().map_err(|e| invalid(e.to_string()))?;
+    if input.enabled {
+        let models = chatgpt::models(&state)
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        if !models
+            .as_array()
+            .is_some_and(|models| models.iter().any(|m| m["id"] == input.model))
+        {
+            return Err(invalid(
+                "Dieses Modell ist für dein ChatGPT-Konto nicht verfügbar.",
+            ));
+        }
+    }
+    sqlx::query("UPDATE ai_control SET settings=$1,paused_reason=NULL WHERE id=1")
+        .bind(json!(&*input))
+        .execute(&state.pool)
+        .await?;
+    events::publish(&state.pool, "ai.updated", None).await;
+    Ok(web::Json(json!(&*input)))
 }
 
 async fn ping(state: web::Data<State>) -> Response {
@@ -150,11 +237,17 @@ async fn dashboard(state: web::Data<State>) -> Response {
     )
     .fetch_all(&state.pool)
     .await?;
+    let trend: Vec<(String, i64, i64)> = sqlx::query_as("WITH days AS (SELECT generate_series((now() AT TIME ZONE 'UTC')::date - 6, (now() AT TIME ZONE 'UTC')::date, interval '1 day') AS day) SELECT to_char(d.day,'YYYY-MM-DD'),count(c.id) FILTER (WHERE c.trigger != 'manual'),count(c.id) FILTER (WHERE c.trigger = 'manual') FROM days d LEFT JOIN clips c ON c.created_at >= d.day AT TIME ZONE 'UTC' AND c.created_at < (d.day + interval '1 day') AT TIME ZONE 'UTC' AND c.status != 'deleting' GROUP BY d.day ORDER BY d.day")
+        .fetch_all(&state.pool).await?;
+    let trend: Vec<_> = trend
+        .into_iter()
+        .map(|(day, automatic, manual)| json!({"day":day,"automatic":automatic,"manual":manual}))
+        .collect();
     Ok(web::Json(json!({"stats": {
         "recording":streamers.iter().filter(|s| s["status"]=="recording").count(), "streamers":streamers.len(),
         "clips_today":today, "clips_ready":count("ready"), "stored_bytes":stored,
         "pending":ACTIVE.iter().map(|status| count(status)).sum::<i64>(), "failed":count("failed"),
-    }, "streamers":streamers, "clips":clips, "activity":activity, "settings":services::settings(&state.pool).await?})))
+    }, "trend":trend, "streamers":streamers, "clips":clips, "activity":activity, "settings":services::settings(&state.pool).await?})))
 }
 
 async fn list_streamers(state: web::Data<State>) -> Response {
@@ -188,8 +281,8 @@ async fn add_streamer(
         return Err(conflict("Dieser Streamer ist bereits in deiner Liste."));
     }
     let id = existing.map_or_else(Uuid::new_v4, |s| s.id);
-    let streamer: Streamer = sqlx::query_as("INSERT INTO streamers(id,login,enabled,quality,priority,pre_roll,post_roll,threshold_db,auto_clip,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO UPDATE SET enabled=EXCLUDED.enabled,quality=EXCLUDED.quality,priority=EXCLUDED.priority,pre_roll=EXCLUDED.pre_roll,post_roll=EXCLUDED.post_roll,threshold_db=EXCLUDED.threshold_db,auto_clip=EXCLUDED.auto_clip,status=EXCLUDED.status,deleted_at=NULL,last_error=NULL,next_check_at=NULL RETURNING *")
-        .bind(id).bind(&input.login).bind(input.enabled).bind(input.quality).bind(input.priority).bind(input.pre_roll).bind(input.post_roll).bind(input.threshold_db).bind(input.auto_clip).bind(if input.enabled {"waiting"} else {"paused"}).fetch_one(&mut *tx).await?;
+    let streamer: Streamer = sqlx::query_as("INSERT INTO streamers(id,login,enabled,quality,priority,pre_roll,post_roll,threshold_db,auto_clip,status,trigger_profile) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(id) DO UPDATE SET enabled=EXCLUDED.enabled,quality=EXCLUDED.quality,priority=EXCLUDED.priority,pre_roll=EXCLUDED.pre_roll,post_roll=EXCLUDED.post_roll,threshold_db=EXCLUDED.threshold_db,auto_clip=EXCLUDED.auto_clip,status=EXCLUDED.status,trigger_profile=EXCLUDED.trigger_profile,deleted_at=NULL,last_error=NULL,next_check_at=NULL RETURNING *")
+        .bind(id).bind(&input.login).bind(input.enabled).bind(input.quality).bind(input.priority).bind(input.pre_roll).bind(input.post_roll).bind(input.threshold_db).bind(input.auto_clip).bind(if input.enabled {"waiting"} else {"paused"}).bind(json!(input.trigger_profile)).fetch_one(&mut *tx).await?;
     services::activity(
         &mut tx,
         "system",
@@ -208,10 +301,16 @@ async fn update_streamer(
     payload: web::Json<Value>,
     _: ApplicationRequest,
 ) -> Response {
-    let streamer = get_streamer(&state, *id).await?;
+    let mut tx = state.pool.begin().await?;
+    let streamer: Streamer =
+        sqlx::query_as("SELECT * FROM streamers WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
+            .bind(*id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(missing)?;
     let mut input = json!({"login":streamer.login,"enabled":streamer.enabled,"quality":streamer.quality,
         "priority":streamer.priority,"pre_roll":streamer.pre_roll,"post_roll":streamer.post_roll,
-        "threshold_db":streamer.threshold_db,"auto_clip":streamer.auto_clip});
+        "threshold_db":streamer.threshold_db,"auto_clip":streamer.auto_clip,"trigger_profile":streamer.trigger_profile});
     let patch = payload
         .as_object()
         .ok_or_else(|| invalid("JSON-Objekt erwartet."))?;
@@ -224,11 +323,133 @@ async fn update_streamer(
     let mut input: StreamerInput =
         serde_json::from_value(input).map_err(|_| invalid("Ungültige Streamer-Einstellungen."))?;
     input.validate().map_err(invalid)?;
-    let result: Streamer = sqlx::query_as("UPDATE streamers SET enabled=$2,quality=$3,priority=$4,pre_roll=$5,post_roll=$6,threshold_db=$7,auto_clip=$8,status=CASE WHEN $9 THEN $10 ELSE status END,next_check_at=CASE WHEN $9 THEN NULL ELSE next_check_at END,last_error=CASE WHEN $9 THEN NULL ELSE last_error END WHERE id=$1 RETURNING *")
+    let result: Streamer = sqlx::query_as("UPDATE streamers SET enabled=$2,quality=$3,priority=$4,pre_roll=$5,post_roll=$6,threshold_db=$7,auto_clip=$8,status=CASE WHEN $9 THEN $10 ELSE status END,next_check_at=CASE WHEN $9 THEN NULL ELSE next_check_at END,last_error=CASE WHEN $9 THEN NULL ELSE last_error END,trigger_profile=$11 WHERE id=$1 RETURNING *")
         .bind(*id).bind(input.enabled).bind(input.quality).bind(input.priority).bind(input.pre_roll).bind(input.post_roll).bind(input.threshold_db).bind(input.auto_clip).bind(patch.contains_key("enabled"))
-        .bind(if input.enabled {"waiting"} else {"paused"}).fetch_one(&state.pool).await?;
+        .bind(if input.enabled {"waiting"} else {"paused"}).bind(json!(input.trigger_profile)).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
     events::publish(&state.pool, "stream.updated", Some(*id)).await;
     Ok(web::Json(json!(result)))
+}
+
+async fn signal_history(
+    state: &State,
+    id: Uuid,
+) -> Result<(Option<Recording>, Vec<Signal>), ApiError> {
+    get_streamer(state, id).await?;
+    let recording: Option<Recording> = sqlx::query_as(
+        "SELECT * FROM recordings WHERE streamer_id=$1 ORDER BY started_at DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let mut frames = Vec::new();
+    if let Some(recording) = &recording {
+        let batches: Vec<Value> = sqlx::query_scalar("SELECT frames FROM (SELECT start_ms,frames FROM trigger_samples WHERE recording_id=$1 AND created_at > now()-interval '15 minutes' ORDER BY start_ms DESC LIMIT 900) recent ORDER BY start_ms")
+            .bind(recording.id).fetch_all(&state.pool).await?;
+        for batch in batches {
+            frames
+                .extend(serde_json::from_value::<Vec<Signal>>(batch).map_err(anyhow::Error::from)?);
+        }
+        if let Some(last) = frames.last() {
+            let cutoff = last.time_ms - 900_000;
+            frames.retain(|frame| frame.time_ms > cutoff);
+        }
+    }
+    Ok((recording, frames))
+}
+
+async fn trigger_signals(state: web::Data<State>, id: web::Path<Uuid>) -> Response {
+    let (recording, frames) = signal_history(&state, *id).await?;
+    let cutoff = frames.last().map_or(0, |frame| frame.time_ms - 300_000);
+    let recent: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.time_ms > cutoff)
+        .collect();
+    let (count, last): (i64, Option<DateTime<Utc>>) = sqlx::query_as("SELECT count(*),max(created_at) FROM trigger_events WHERE streamer_id=$1 AND created_at > now()-interval '1 hour'")
+        .bind(*id).fetch_one(&state.pool).await?;
+    Ok(web::Json(
+        json!({"recording":recording,"frames":recent,"hourly_count":count,"last_trigger_at":last}),
+    ))
+}
+
+async fn test_triggers(
+    state: web::Data<State>,
+    id: web::Path<Uuid>,
+    profile: web::Json<Profile>,
+    _: ApplicationRequest,
+) -> Response {
+    profile.validate().map_err(invalid)?;
+    let (recording, frames) = signal_history(&state, *id).await?;
+    let mut engine = Engine::default();
+    let hits: Vec<_> = frames
+        .iter()
+        .filter_map(|signal| engine.evaluate(&profile, signal))
+        .collect();
+    let seconds = frames.len() as f64 / 4.0;
+    Ok(web::Json(
+        json!({"hits":hits,"seconds":seconds,"recording_started_at":recording.map(|r| r.started_at),
+        "chat_available":frames.iter().any(|s| s.chat_users.is_some()),"sample_count":frames.len()}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyTriggers {
+    target_ids: Vec<Uuid>,
+}
+
+async fn copy_triggers(
+    state: web::Data<State>,
+    id: web::Path<Uuid>,
+    payload: web::Json<CopyTriggers>,
+    _: ApplicationRequest,
+) -> Response {
+    let mut ids = payload.target_ids.clone();
+    ids.sort();
+    ids.dedup();
+    ids.retain(|target| target != &*id);
+    if ids.is_empty() || ids.len() > 50 {
+        return Err(invalid("Bitte 1–50 andere Streamer auswählen."));
+    }
+    let mut locks = ids.clone();
+    locks.push(*id);
+    locks.sort();
+    let mut tx = state.pool.begin().await?;
+    let rows: Vec<Streamer> = sqlx::query_as(
+        "SELECT * FROM streamers WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id FOR UPDATE",
+    )
+    .bind(&locks)
+    .fetch_all(&mut *tx)
+    .await?;
+    if rows.len() != locks.len() {
+        return Err(missing());
+    }
+    let source = rows.iter().find(|row| row.id == *id).ok_or_else(missing)?;
+    sqlx::query(
+        "UPDATE streamers SET trigger_profile=$2,pre_roll=$3,post_roll=$4 WHERE id=ANY($1)",
+    )
+    .bind(&ids)
+    .bind(&source.trigger_profile)
+    .bind(source.pre_roll)
+    .bind(source.post_roll)
+    .execute(&mut *tx)
+    .await?;
+    services::activity(
+        &mut tx,
+        "system",
+        &format!(
+            "Trigger von @{} auf {} Kanäle kopiert.",
+            source.login,
+            ids.len()
+        ),
+        Some(*id),
+    )
+    .await?;
+    tx.commit().await?;
+    for id in &ids {
+        events::publish(&state.pool, "stream.updated", Some(*id)).await;
+    }
+    Ok(web::Json(json!({"copied":ids.len()})))
 }
 
 async fn remove_streamer(

@@ -1,4 +1,7 @@
+pub mod ai;
 pub mod api;
+pub mod chat;
+pub mod chatgpt;
 pub mod config;
 pub mod error;
 pub mod events;
@@ -8,4 +11,5 @@ pub mod recording;
 pub mod services;
 pub mod state;
 pub mod storage;
+pub mod triggers;
 pub mod worker;

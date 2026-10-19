@@ -15,7 +15,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    events,
+    ai, events,
     media::{overlaps, render, safe_path, tail},
     models::{ACTIVE, Clip, ManifestEntry, Recording, Segment, Streamer},
     recording, services,
@@ -27,6 +27,7 @@ pub async fn recover(state: &State) -> Result<()> {
     sqlx::query("UPDATE clips SET status='queued' WHERE status IN ('cutting','uploading')")
         .execute(&mut *tx)
         .await?;
+    sqlx::query("UPDATE ai_runs SET status='failed',message='Analyse durch Worker-Neustart unterbrochen.',finished_at=now() WHERE status IN ('preparing','analyzing')").execute(&mut *tx).await?;
     let recordings: Vec<Recording> = sqlx::query_as("UPDATE recordings SET ended_at=now(),error='Aufnahmesitzung nach Worker-Neustart abgeschlossen.' WHERE ended_at IS NULL RETURNING *").fetch_all(&mut *tx).await?;
     for recording in recordings {
         services::finalize_pending(&mut tx, &recording).await?;
@@ -40,6 +41,10 @@ pub async fn recover(state: &State) -> Result<()> {
     )
     .await?;
     tx.commit().await?;
+    let analysis = state.config.data_dir.join("analysis");
+    if analysis.exists() {
+        tokio::fs::remove_dir_all(analysis).await?;
+    }
     events::publish(&state.pool, "system.updated", None).await;
     Ok(())
 }
@@ -127,7 +132,7 @@ pub async fn clean_buffers(state: &State, buffer_seconds: i64) -> Result<()> {
                 .fetch_one(&mut *tx)
                 .await?;
         let protected: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT start_ms,end_ms FROM clips WHERE recording_id=$1 AND status=ANY($2)",
+            "SELECT start_ms,end_ms FROM clips WHERE recording_id=$1 AND status=ANY($2) UNION ALL SELECT start_ms,end_ms FROM ai_runs WHERE recording_id=$1 AND status IN ('preparing','analyzing')",
         )
         .bind(id)
         .bind(ACTIVE)
@@ -187,7 +192,16 @@ pub async fn clean_buffers(state: &State, buffer_seconds: i64) -> Result<()> {
         sqlx::query("UPDATE clips SET status='deleting',retry_at=NULL,attempts=0 WHERE status='ready' AND NOT favorite AND created_at < now()-($1*interval '1 day')")
             .bind(settings.retention_days as f64).execute(&state.pool).await?;
     }
+    sqlx::query("DELETE FROM trigger_samples WHERE created_at < now()-interval '15 minutes'")
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("DELETE FROM trigger_events WHERE created_at < now()-interval '1 hour'")
+        .execute(&state.pool)
+        .await?;
     sqlx::query("DELETE FROM activities WHERE created_at < now()-interval '30 days'")
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("DELETE FROM ai_runs WHERE finished_at < now()-interval '7 days'")
         .execute(&state.pool)
         .await?;
     // Keep session metadata referenced by clips; discard empty offline checks after a week.
@@ -242,6 +256,7 @@ pub async fn serve(state: State) -> Result<()> {
         "Es läuft bereits ein Aufnahme-Worker für diese Datenbank."
     );
     recover(&state).await?;
+    let semantic = tokio::spawn(ai::serve(state.clone()));
     let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
@@ -331,6 +346,8 @@ pub async fn serve(state: State) -> Result<()> {
             tracing::error!(%error,"Worker cycle failed; retrying");
         }
     }
+    semantic.abort();
+    let _ = semantic.await;
     if let Some(error) = fatal {
         // Leadership has been lost. Stop all work before another supervisor can take over.
         for recorder in recorders.values() {

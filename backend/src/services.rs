@@ -52,8 +52,8 @@ pub async fn create_clip(
         .context("Der Videopuffer ist noch leer. Bitte kurz warten.")?
         .max(event_ms - i64::from(streamer.pre_roll) * 1000);
     let end = event_ms + i64::from(streamer.post_roll) * 1000;
-    if trigger == "audio" {
-        let existing: Option<Clip> = sqlx::query_as("SELECT * FROM clips WHERE recording_id=$1 AND trigger='audio' AND status='collecting' AND end_ms >= $2 ORDER BY created_at DESC LIMIT 1 FOR UPDATE")
+    if trigger != "manual" {
+        let existing: Option<Clip> = sqlx::query_as("SELECT * FROM clips WHERE recording_id=$1 AND trigger != 'manual' AND status='collecting' AND end_ms >= $2 ORDER BY created_at DESC LIMIT 1 FOR UPDATE")
             .bind(recording.id).bind(event_ms - 3000).fetch_optional(&mut *db).await?;
         if let Some(existing) = existing
             && end - existing.start_ms <= 120_000
@@ -61,7 +61,7 @@ pub async fn create_clip(
             return Ok(sqlx::query_as("UPDATE clips SET end_ms=GREATEST(end_ms,$2), score=GREATEST(score,$3) WHERE id=$1 RETURNING *")
                     .bind(existing.id).bind(end).bind(score).fetch_one(&mut *db).await?);
         }
-        let recent = sqlx::query_as::<_, Clip>("SELECT * FROM clips WHERE recording_id=$1 AND trigger='audio' AND status NOT IN ('failed','deleting') AND end_ms >= $2 ORDER BY created_at DESC LIMIT 1")
+        let recent = sqlx::query_as::<_, Clip>("SELECT * FROM clips WHERE recording_id=$1 AND trigger != 'manual' AND status NOT IN ('failed','deleting') AND end_ms >= $2 ORDER BY created_at DESC LIMIT 1")
             .bind(recording.id).bind(event_ms).fetch_optional(&mut *db).await?;
         if let Some(recent) = recent {
             return Ok(recent);
@@ -69,8 +69,8 @@ pub async fn create_clip(
     }
     let title = format!(
         "{} · {}",
-        if trigger == "audio" {
-            "Audio-Highlight"
+        if trigger != "manual" {
+            "Trigger-Clip"
         } else {
             "Manueller Clip"
         },
@@ -149,6 +149,10 @@ pub async fn streamer_views(pool: &PgPool) -> Result<Vec<Value>> {
             object.insert("recording_id".into(), json!(recording.map(|r| r.id)));
             object.insert("started_at".into(), json!(recording.map(|r| r.started_at)));
             object.insert("audio_db".into(), json!(recording.and_then(|r| r.audio_db)));
+            object.insert(
+                "trigger_state".into(),
+                json!(recording.map(|r| &r.trigger_state)),
+            );
             object.insert(
                 "buffer_seconds".into(),
                 json!(
