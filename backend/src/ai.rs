@@ -302,25 +302,48 @@ fn schema() -> Value {
 
 /// Only a terminal completed event can authorize a clip; partial model text never does.
 pub fn parse_response(stream: &str) -> Result<Decision> {
-    let mut decision = None;
+    let mut completed = false;
+    let mut final_text = String::new();
+    let mut fragments = std::collections::BTreeMap::new();
     for line in stream.lines().filter_map(|line| line.strip_prefix("data:")) {
-        if line.trim() == "[DONE]" {
+        if line.trim().is_empty() || line.trim() == "[DONE]" {
             continue;
         }
-        let event: Value = serde_json::from_str(line.trim())?;
+        let event: Value =
+            serde_json::from_str(line.trim()).context("Ungültiges ChatGPT-Streamereignis.")?;
         match event["type"].as_str() {
+            Some("response.output_text.delta" | "response.output_text.done") => {
+                let key = (
+                    event["output_index"].as_u64().unwrap_or(0),
+                    event["content_index"].as_u64().unwrap_or(0),
+                );
+                let text = fragments.entry(key).or_insert_with(String::new);
+                if event["type"] == "response.output_text.done" {
+                    if let Some(done) = event["text"].as_str() {
+                        *text = done.to_owned();
+                    }
+                } else if let Some(delta) = event["delta"].as_str() {
+                    text.push_str(delta);
+                }
+            }
             Some("response.completed") => {
-                let output = event["response"]["output"]
+                ensure!(
+                    event["response"]["status"]
+                        .as_str()
+                        .is_none_or(|s| s == "completed"),
+                    "ChatGPT-Antwort wurde nicht abgeschlossen."
+                );
+                completed = true;
+                // Plan-usage streams may deliver text only in delta/done events.
+                final_text = event["response"]["output"]
                     .as_array()
-                    .context("KI-Ausgabe fehlt.")?;
-                let text = output
-                    .iter()
+                    .into_iter()
+                    .flatten()
                     .filter(|o| o["type"] == "message")
                     .flat_map(|o| o["content"].as_array().into_iter().flatten())
                     .filter(|c| c["type"] == "output_text")
                     .filter_map(|c| c["text"].as_str())
                     .collect::<String>();
-                decision = Some(serde_json::from_str(&text)?);
             }
             Some("response.failed" | "response.incomplete" | "error") => {
                 let code = event["response"]["error"]["code"]
@@ -332,7 +355,18 @@ pub fn parse_response(stream: &str) -> Result<Decision> {
             _ => {}
         }
     }
-    decision.context("ChatGPT-Verbindung ohne abgeschlossene Antwort beendet.")
+    ensure!(
+        completed,
+        "ChatGPT-Verbindung ohne abgeschlossene Antwort beendet."
+    );
+    if final_text.trim().is_empty() {
+        final_text = fragments.into_values().collect();
+    }
+    ensure!(
+        !final_text.trim().is_empty(),
+        "ChatGPT hat keine Textausgabe geliefert."
+    );
+    serde_json::from_str(&final_text).context("ChatGPT hat kein gültiges Highlight-JSON geliefert.")
 }
 
 async fn infer(
@@ -557,6 +591,17 @@ mod tests {
             json!({"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":decision.to_string()}]}]}})
         );
         assert!(!parse_response(&completed).unwrap().highlight);
+        let delta_only = format!(
+            "data:\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n",
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":decision.to_string()}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+        );
+        assert!(!parse_response(&delta_only).unwrap().highlight);
+        let unfinished = delta_only.replace("response.completed", "response.in_progress");
+        assert!(
+            parse_response(&unfinished).is_err(),
+            "Complete JSON alone must never authorize a clip"
+        );
         assert!(parse_response(&format!("{completed}data: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"code\":\"subscription_sharing_usage_limit_exceeded\"}}}}}}\n")).is_err());
     }
     #[test]
