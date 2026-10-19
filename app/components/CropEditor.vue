@@ -79,7 +79,7 @@ onBeforeUnmount(() => finish())
       </div>
       <template v-for="region in cropRegions" :key="`label-${region.key}`"><button v-if="selected !== region.key" type="button" :disabled="disabled" class="absolute z-30 truncate rounded bg-black/85 px-2 py-1 text-[10px]" :style="{ left: `${model[region.key].x * 100}%`, top: `${model[region.key].y * 100}%`, maxWidth: `${Math.min(.45, 1 - model[region.key].x) * 100}%`, color: region.color }" :aria-label="`${region.label} auswählen`" @click="selected = region.key">{{ region.label }}</button></template>
     </div>
-    <p v-if="selected === 'facecam' && !model.facecam_enabled" class="hint mt-4">Facecam ist noch ausgeblendet. Aktiviere sie unten, um den Ausschnitt auch in der Hochkant-Vorschau zu sehen.</p>
-    <p v-else-if="selected === 'chat' && model.chat_mode === 'keep'" class="hint mt-4">Chat bleibt aktuell im Quellbild. Wähle unten „schwärzen“ oder „separates Panel“, um diesen Ausschnitt zu verwenden.</p>
+    <p v-if="selected === 'facecam' && !model.facecam_enabled" class="hint mt-4">Facecam ist noch ausgeblendet. Wähle oben unter „Anordnung im Hochkant-Video“ die Position „Oben“ oder „Unten“, um den Ausschnitt separat anzuzeigen.</p>
+    <p v-else-if="selected === 'chat' && model.chat_mode === 'keep'" class="hint mt-4">Chat bleibt aktuell im Quellbild. Wähle oben bei „Chat im Video“ die Option „schwärzen“ oder „separates Panel“, um diesen Ausschnitt zu verwenden.</p>
   </div>
 </template>

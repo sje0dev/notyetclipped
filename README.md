@@ -19,7 +19,7 @@ docker compose up --build -d
 
 Die Beispielkonfiguration startet PostgreSQL, RustFS als lokalen S3-kompatiblen Speicher, Datenbankmigrationen, Actix-API, Rust-Worker und Nuxt. Datenbank, S3-Dateien und Arbeitsverzeichnis liegen in getrennten Docker-Volumes. Der erste Rust-Build benötigt etwas Zeit.
 
-Im Dashboard einen Kanal hinzufügen. Der Worker startet die Aufnahme, sobald der Kanal erreichbar ist und ein Aufnahmeplatz frei ist. Unter **Streamer → Kanal → Automationen** die Trigger konfigurieren. **„Moment clippen“** reserviert einen manuellen Ausschnitt aus dem laufenden Puffer.
+Im Dashboard einen Kanal hinzufügen. Der Worker startet die Aufnahme, sobald der Kanal erreichbar ist und ein Aufnahmeplatz frei ist. Ein Klick auf die Streamer-Karte öffnet direkt die Kanaleinstellungen. Unter **Streamer → Kanal → Automationen** die Trigger konfigurieren. **„Moment clippen“** reserviert einen manuellen Ausschnitt aus dem laufenden Puffer.
 
 ```sh
 docker compose logs -f worker api
@@ -106,7 +106,9 @@ Anmeldedaten liegen atomar geschrieben mit `0600` in `/data/auth/chatgpt.json`, 
 
 ### Hochkant & Schnittliste
 
-Unter **Streamer → Kanal → Hochkant & Bearbeitung** Spiel, Facecam oder Chat auswählen und die Box direkt im Quellbild verschieben. Acht Griffe an Ecken und Kanten ändern ihre Größe; die Ausschnitte bleiben innerhalb des Bildes. Maus und Touch werden unterstützt. Pfeiltasten verschieben fein, Umschalt + Pfeiltasten ändern die Größe, Escape verwirft die laufende Ziehbewegung. Die Hochkant-Vorschau aktualisiert sich unmittelbar. Grundlage ist das letzte fertige Clip-Vorschaubild; über das Aktualisieren-Icon lässt es sich neu laden. Facecam wahlweise oben oder unten, mit Größenregler; Hauptbild vollständig mit schwarzen Rändern oder flächenfüllend beschnitten. Chat bleibt im Bild, wird geschwärzt oder bekommt ein separates Panel unten. Das Chat-Panel übernimmt vorhandene Bildpixel, keine aus IRC rekonstruierten Nachrichten. Bei geändertem Stream-Layout muss das Profil angepasst werden.
+Unter **Streamer → Kanal → Hochkant & Bearbeitung** ist die **Anordnung im Hochkant-Video** immer sichtbar: Facecam **Aus / Oben / Unten** auswählen; „Oben“ und „Unten“ aktivieren den separaten Facecam-Ausschnitt direkt. Ein Größenregler bestimmt ihre Höhe. Hauptbild vollständig mit schwarzen Rändern oder flächenfüllend beschnitten; Chat im Bild belassen, schwärzen oder als separates Panel unten anzeigen. Diese Optionen sind unabhängig vom ausgewählten Quell-Ausschnitt erreichbar.
+
+Darunter Spiel, Facecam oder Chat auswählen und die Box direkt im Quellbild verschieben. Acht Griffe an Ecken und Kanten ändern ihre Größe; die Ausschnitte bleiben innerhalb des Bildes. Maus und Touch werden unterstützt. Pfeiltasten verschieben fein, Umschalt + Pfeiltasten ändern die Größe, Escape verwirft die laufende Ziehbewegung. Die Hochkant-Vorschau aktualisiert sich bei Ausschnitt- und Anordnungsänderungen unmittelbar. Grundlage ist das letzte fertige Clip-Vorschaubild; über das Aktualisieren-Icon lässt es sich neu laden. Das Chat-Panel übernimmt vorhandene Bildpixel, keine aus IRC rekonstruierten Nachrichten. Bei geändertem Stream-Layout muss das Profil angepasst werden.
 
 Am fertigen Clip **Zur Bearbeitung** wählen. Optional neue fertige Clips automatisch einreihen. Ein Auftrag speichert eine unveränderliche Kopie des Layouts; Doppelklicks erstellen keine parallelen Duplikate. Der Worker lädt das private Original aus S3, rendert ein separates **720×1280 / 30 fps / H.264 + AAC** MP4 und lädt es wieder hoch. In der **Schnittliste** sind Vorschau, Download und Wiederholung fehlgeschlagener Aufträge verfügbar. Höchstens ein Hochkant-Auftrag läuft gleichzeitig und teilt die Exportplätze mit normalen Clips. Unterbrochene Aufträge werden beim Neustart erneut eingeplant. Beim Löschen des Originals werden auch seine Hochkant-Dateien entfernt.
 
