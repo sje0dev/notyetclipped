@@ -79,6 +79,9 @@ export interface CropRect { x: number; y: number; width: number; height: number 
 export interface EditingSettings { auto_queue: boolean; framing: 'fit' | 'fill'; gameplay: CropRect; facecam_enabled: boolean; facecam: CropRect; facecam_position: 'top' | 'bottom'; facecam_percent: number; chat_mode: 'keep' | 'hide' | 'panel'; chat: CropRect }
 export interface EditJob { id: string; clip_id: string; title: string; streamer_id: string; streamer_login: string; status: string; profile: EditingSettings; size_bytes: number; error: string | null; created_at: string; video_url?: string; download_url?: string }
 
+export interface Job { id: string; kind: 'recording' | 'clip' | 'ai' | 'edit'; label: string; streamer_id: string; status: string; active: boolean; created_at: string; finished_at: string | null; message: string | null }
+export interface JobLog { id: number; level: string; message: string; created_at: string }
+
 export interface Settings {
   max_recordings: number
   max_exports: number

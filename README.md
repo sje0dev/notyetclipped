@@ -112,7 +112,7 @@ Am fertigen Clip **Zur Bearbeitung** wählen. Optional neue fertige Clips automa
 
 ### Jobs & Aktivitäten
 
-Oben rechts zeigt das Job-Icon laufende Aufnahmen, KI-Vorbereitung/Inferenz, Clip-Exporte und Hochkant-Aufträge sowie kürzlich abgeschlossene Jobs. Ein Klick öffnet das Schrittprotokoll; das Download-Icon exportiert die letzten bis zu 500 Einträge als `.log`. Enthalten sind Start, wichtige Verarbeitungsschritte, Abschluss und Fehler, keine OAuth-Tokens oder vollständigen Transkripte. Logs bleiben sieben Tage gespeichert. Wartende Aufträge erklären ihren Zustand über Status und KI-Limit-Anzeige. Die Glocke enthält die letzten 30 Aktivitäten; der Gelesen-Marker wird lokal im Browser gespeichert.
+Unter **Jobs** in der Navigation stehen laufende Aufnahmen, KI-Vorbereitung/Inferenz, Clip-Exporte und Hochkant-Aufträge sowie kürzlich abgeschlossene Jobs. Die Liste lässt sich nach Status, Job-Typ und Suchtext filtern. Das Job-Icon oben rechts bietet eine Schnellübersicht; **Logs** führt von dort direkt zum ausgewählten Protokoll auf der Jobs-Seite. Der Link `/jobs?job=<ID>#job-logs` lässt sich auch direkt öffnen. Die Protokollansicht aktualisiert sich alle fünf Sekunden und exportiert die letzten bis zu 500 Einträge als `.log`. Enthalten sind Start, wichtige Verarbeitungsschritte, Abschluss und Fehler, keine OAuth-Tokens oder vollständigen Transkripte. Logs bleiben sieben Tage gespeichert und sind über ihren direkten Link auch erreichbar, wenn der Job nicht mehr in der Übersicht der letzten Stunde steht. Wartende Aufträge erklären ihren Zustand über Status und KI-Limit-Anzeige. Die Glocke enthält die letzten 30 Aktivitäten; der Gelesen-Marker wird lokal im Browser gespeichert.
 
 ## Streamzugriff
 

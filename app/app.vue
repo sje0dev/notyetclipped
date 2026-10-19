@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { LayoutDashboard, Radio, Clapperboard, Settings2, Film, Menu, X, Check, CircleAlert, ChevronRight, PanelLeft, Search } from '@lucide/vue'
+import { LayoutDashboard, Radio, Clapperboard, Settings2, Film, ListTodo, Menu, X, Check, CircleAlert, ChevronRight, PanelLeft, Search } from '@lucide/vue'
 import type { Health } from '~/types'
 const route = useRoute()
 const mobileNav = ref(false)
@@ -14,6 +14,7 @@ const navigation = [
   { path: '/streamers', label: 'Streamer', icon: Radio },
   { path: '/clips', label: 'Clip-Bibliothek', icon: Clapperboard },
   { path: '/edits', label: 'Schnittliste', icon: Film },
+  { path: '/jobs', label: 'Jobs', icon: ListTodo },
 ]
 const currentPage = computed(() => route.path.startsWith('/streamers/') ? 'Streamer' : navigation.find(item => item.path === route.path)?.label || 'Einstellungen')
 const activePath = computed(() => route.path.startsWith('/streamers/') ? '/streamers' : route.path)
